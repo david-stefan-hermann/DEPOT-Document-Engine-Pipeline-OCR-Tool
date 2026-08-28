@@ -42,26 +42,55 @@ des Projekts.
    aus dem offiziell unterstützten Treiber-Pfad von TrueNAS 25.10 heraus — auch mit
    aktiviertem "Install NVIDIA Drivers"-Schalter im Apps-Pool, da dieser Schalter genau
    diesen (Pascal-inkompatiblen) offenen Kernel-Treiber installiert.
-5. **Community-Alternative identifiziert, aber (vorerst) nicht verwendet:**
-   [zzzhouuu/truenas-nvidia-drivers](https://github.com/zzzhouuu/truenas-nvidia-drivers)
-   bietet inoffizielle Legacy-Treiber-Builds (via `systemd-sysext`) für GTX 700/900/10-Serie.
-   Nachteile: kein Build für die exakte Serverversion (25.10.4) verfügbar (nur
-   25.10.5/25.10.6/26.0.0-BETA.3 zum Zeitpunkt der Recherche), Treiber-Blob stammt von
-   einer privaten Drittanbieter-Domain, muss nach jedem kernel-ändernden TrueNAS-Update
-   neu eingerichtet werden.
-6. **Entscheidung:** Vorerst **CPU-only** betreiben. Begründung:
-   - Der Workload ist Batch-Klassifikation kurzer Texte (keine Echtzeit-Chat-Anfragen),
-     bei ca. 8–15 Tokens/Sekunde auf CPU sind das grob 5–15 Sekunden pro Dokument —
-     für unregelmäßige Scan-Batches unkritisch.
-   - Die GPU brächte keinen garantierten Gewinn (6GB VRAM-Risiko bei Kontext-Overflow
-     kann Ollama-Performance laut Community-Benchmarks um das 5–20-fache einbrechen
-     lassen) und würde laufenden Wartungsaufwand durch einen inoffiziellen Treiber
-     bedeuten.
-   - Der Wechsel zu GPU-Beschleunigung bleibt jederzeit möglich, ohne die
-     DEPOT-Pipeline selbst anzufassen (siehe unten) — daher bewusst als spätere
-     Option offengehalten statt jetzt erzwungen.
+5. **Community-Treiber-Optionen recherchiert:**
+   - [zzzhouuu/truenas-nvidia-drivers](https://github.com/zzzhouuu/truenas-nvidia-drivers) —
+     vorgefertigte Legacy-Treiber-Builds (via `systemd-sysext`) für GTX 700/900/10-Serie.
+     Nachteil: kein Build für die exakte Serverversion (25.10.4) verfügbar (nur
+     25.10.5/25.10.6/26.0.0-BETA.3), Treiber-Blob stammt von einer privaten
+     Drittanbieter-Domain.
+   - [kaemis02/truenas-nvidia-extension](https://github.com/kaemis02/truenas-nvidia-extension) —
+     **baut den Treiber selbst** aus offiziellen Quellen (offizielles TrueNAS-Update-Image
+     + offizielles `truenas/scale-build`-Repo + offizieller NVIDIA-Treiber-Download),
+     passend zu jeder TrueNAS-Version inkl. exakt 25.10.4. Laut README explizit getestet
+     mit **"TrueNAS Scale 25.10.4 und NVIDIA GP106 [GeForce GTX 1060 6GB]"** — exakt unsere
+     Kombination. Dafür entschieden, da vertrauenswürdiger als ein fertiger Blob unbekannter
+     Herkunft.
+6. **Zwischenzeitlich CPU-only betrieben**, während die GPU-Frage offen war (Begründung:
+   Workload ist Batch-Klassifikation kurzer Texte, ca. 8–15 Tokens/Sekunde auf CPU sind
+   grob 5–15 Sekunden pro Dokument — für unregelmäßige Scan-Batches praktikabel, auch wenn
+   spürbar langsamer als gewünscht).
+7. **Build-Versuche und Lessons Learned** (siehe auch Abschnitt "GPU-Treiber-Build" unten
+   für den aktuellen Stand):
+   - **Fehler #1:** Build zuerst direkt auf dem TrueNAS-Server selbst versucht. Falsch —
+     das Projekt-README sagt explizit: *"The build is entirely offline from TrueNAS's
+     perspective — you run it on any Linux machine with Docker, then upload the resulting
+     file to your server."* Ein `--privileged` Docker-Build mit Chroot-/Squashfs-Manipulation
+     hat auf dem produktiven Server (der auch Nextcloud betreibt) nichts verloren.
+   - **Fehler #2 (Sackgasse):** Auf dem TrueNAS-Server schlug `apt install` innerhalb des
+     Chroots mit `exit code 100` fehl, ohne dass die eigentliche Fehlermeldung sichtbar
+     wurde (verschluckt vom `scale_build`-Basis-Codepfad). Eine manuelle Nachstellung des
+     Chroot-Befehls zeigte `"Package management tools are disabled on TrueNAS appliances"`
+     — TrueNAS' eingebauter Schutz gegen manuelle Paketverwaltung, eingebettet direkt im
+     Root-Dateisystem-Image selbst. Diese manuelle Nachstellung war aber unvollständig
+     (fehlende Vorbereitungsschritte, die das offizielle `run_in_chroot` normalerweise
+     macht) und daher kein Beweis für die eigentliche Ursache — siehe Fehler #1, das
+     Ganze hätte dort nie laufen sollen.
+   - **Architektur-Falle:** Ein Linux-Laptop mit **Asahi Linux (Apple Silicon, ARM64)** ist
+     ungeeignet als Build-Host — sowohl das Docker-Image als auch der fertige
+     NVIDIA-x86_64-Treiber müssen zur Ziel-Architektur (x86_64 TrueNAS + x86_64 GTX 1060)
+     passen. Cross-Build via QEMU-Emulation wäre theoretisch möglich, aber unnötiges
+     Risiko bei einem ohnehin fragilen Build.
+   - **Funktionierender Weg:** Windows-PC mit Docker Desktop + WSL2-Ubuntu-Distribution
+     (`wsl --install -d Ubuntu`), da Docker Desktop selbst schon WSL2 als Unterbau nutzt.
+     Docker Desktop → Settings → Resources → WSL Integration muss für die Ubuntu-Distro
+     aktiviert sein. Zusätzliche Stolperfalle: der WSL-Linux-Nutzer muss in der
+     `docker`-Gruppe sein (`sudo usermod -aG docker $USER`, danach Sitzung neu starten),
+     sonst "permission denied" beim Docker-Socket. Der eigentliche Build (`generate.sh`)
+     läuft NICHT unter Git Bash, da dieses kein `/proc/meminfo`/`nproc` bereitstellt, die
+     das Skript zur Ressourcen-Erkennung braucht — nur in einer echten WSL2-Linux-Shell.
+   - Fertige `nvidia.raw` wird per `scp` vom Build-Host auf den TrueNAS-Server übertragen.
 
-## Aktuelles Setup (CPU-only)
+## Aktuelles Ollama-Setup
 
 Ollama läuft als eigener Dockge-Stack, siehe [`infra/ollama/docker-compose.yml`](../infra/ollama/docker-compose.yml).
 Modelldaten liegen persistent unter `/mnt/tank/applications/ollama`.
@@ -81,11 +110,42 @@ ohne beobachtetes Problem — bei tatsächlich spürbarer Verlangsamung anderer 
 eines Batch-Laufs kann `deploy.resources.limits.cpus` in der Compose-Datei nachgerüstet
 werden.
 
-## Später: Wechsel zu GPU
+## GPU-Treiber-Build (Stand: läuft, noch nicht final installiert)
 
-Sobald GPU-Beschleunigung gewünscht/möglich ist (offizieller TrueNAS-Support für neuere
-Baureihen, oder bewusste Entscheidung für den Community-Treiber), reicht es, im
-Ollama-Compose die auskommentierte Sektion zu aktivieren:
+Aktueller Fortschritt beim Nachrüsten der GPU-Beschleunigung (siehe "GPU-Verlauf" oben
+für den vollen Weg dahin):
+
+1. Build mit [kaemis02/truenas-nvidia-extension](https://github.com/kaemis02/truenas-nvidia-extension)
+   auf einer Windows-WSL2-Ubuntu-Umgebung (nicht auf dem TrueNAS-Server) erfolgreich
+   durchgeführt — Ausgabe: `out-25.10.4/nvidia.raw`.
+2. Datei per `scp` nach `/tmp/nvidia.raw` auf den TrueNAS-Server übertragen.
+3. **Noch offen:** Installation auf dem Server selbst, laut Projekt-README (Option B — CLI):
+   ```
+   cp /usr/share/truenas/sysext-extensions/nvidia.raw /root/nvidia.raw.bak
+   systemd-sysext unmerge
+   zfs set readonly=off "$(zfs list -H -o name /usr)"
+   cp /tmp/nvidia.raw /usr/share/truenas/sysext-extensions/nvidia.raw
+   zfs set readonly=on "$(zfs list -H -o name /usr)"
+   systemd-sysext merge
+   systemctl restart docker
+   systemd-sysext status
+   nvidia-smi
+   ```
+4. **Noch offen:** `nvidia-smi` muss die GTX 1060 zeigen, bevor die GPU-Sektion im
+   Ollama-Compose (siehe unten) sinnvoll aktiviert werden kann.
+5. Aufräumen nach den fehlgeschlagenen Host-seitigen Build-Versuchen:
+   `rm -rf /mnt/tank/applications/nvidia-build` auf dem TrueNAS-Server (mehrere GB
+   gecachtes TrueNAS-Update-Image + entpacktes Rootfs vom verworfenen Versuch, den Build
+   direkt auf dem Server auszuführen).
+
+**Nach jedem TrueNAS-Update, das den Kernel ändert:** `generate.sh` mit aktualisierter
+`TRUENAS_VERSION`/`TRUENAS_TAG` erneut laufen lassen und neu installieren — die Extension
+ist kernelversionsgebunden.
+
+## Wechsel zu GPU (Ollama-Compose)
+
+Sobald `nvidia-smi` auf dem Host die Karte zeigt, reicht es, im Ollama-Compose die
+auskommentierte Sektion zu aktivieren:
 ```yaml
     deploy:
       resources:
