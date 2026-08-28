@@ -237,3 +237,92 @@ def test_transient_failure_is_requeued_not_quarantined(monkeypatch, tmp_path, pi
     assert requeued == scan
     # must NOT count toward the permanent-failure quarantine limit
     assert pipeline.state.should_quarantine(scan.name) is False
+
+
+def test_folder_cache_avoids_repeated_webdav_calls(pipeline, client):
+    client.mkcol("Dokumente/Gesundheit")
+
+    call_count = 0
+    real_list = client.list_folders_recursive
+
+    def counting_list(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_list(*args, **kwargs)
+
+    pipeline.webdav.list_folders_recursive = counting_list
+
+    first = pipeline._get_existing_folders()
+    second = pipeline._get_existing_folders()
+
+    assert call_count == 1
+    assert first == second
+
+
+def test_folder_cache_refreshes_after_ttl(monkeypatch, pipeline, client):
+    import depot.pipeline as pipeline_module
+
+    monkeypatch.setattr(pipeline_module, "FOLDER_CACHE_TTL_SECONDS", 0.01)
+    client.mkcol("Dokumente/Gesundheit")
+
+    call_count = 0
+    real_list = client.list_folders_recursive
+
+    def counting_list(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return real_list(*args, **kwargs)
+
+    pipeline.webdav.list_folders_recursive = counting_list
+
+    pipeline._get_existing_folders()
+    time.sleep(0.05)
+    pipeline._get_existing_folders()
+
+    assert call_count == 2
+
+
+def test_remember_folder_makes_new_folder_visible_before_ttl(pipeline, client):
+    pipeline._get_existing_folders()  # populate cache
+    pipeline._remember_folder("Dokumente/Versicherung/KFZ")
+
+    assert "Dokumente/Versicherung/KFZ" in pipeline._get_existing_folders()
+    # the real folder must not have been created on the server by this alone
+    assert "Dokumente/Versicherung/KFZ" not in client.list_folders_recursive("Dokumente")
+
+
+def test_new_folder_is_immediately_visible_to_next_document(monkeypatch, tmp_path, pipeline, fake_server, client):
+    from datetime import date
+
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(path), ocr_failed=False),
+    )
+
+    calls = []
+
+    def fake_classify(**kwargs):
+        calls.append(kwargs["existing_folders"])
+        return (
+            ClassificationResult(
+                folder="Dokumente/Versicherung/KFZ",
+                is_new_folder=True,
+                title="Kfz-Versicherung",
+                issue_date=date(2026, 1, 1),
+                confidence=0.9,
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(classifier, "classify", fake_classify)
+
+    scan1 = _make_scan(tmp_path, name="scan1.pdf")
+    scan2 = _make_scan(tmp_path, name="scan2.pdf")
+    _seed_source_on_server(pipeline, client, scan1)
+    _seed_source_on_server(pipeline, client, scan2)
+
+    pipeline.process_one(scan1)
+    pipeline.process_one(scan2)
+
+    assert "Dokumente/Versicherung/KFZ" not in calls[0]
+    assert "Dokumente/Versicherung/KFZ" in calls[1]

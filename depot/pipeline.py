@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+import time
 from datetime import date
 from pathlib import Path
 
@@ -30,6 +31,12 @@ TRANSIENT_EXCEPTIONS = (
 _TRANSIENT_RETRY_DELAY_SECONDS = 30.0
 MAX_TRANSIENT_RETRIES = 5
 
+# How long the Dokumente/ folder listing is cached before being re-fetched
+# from WebDAV. Folders created by DEPOT itself are added to the cache
+# immediately (see _remember_folder), so this only bounds staleness for
+# folders the user creates/renames by hand while a batch is running.
+FOLDER_CACHE_TTL_SECONDS = 300.0
+
 
 class Pipeline:
     def __init__(
@@ -51,6 +58,25 @@ class Pipeline:
         self.state = state or StateStore(config.state_db_path)
         self._transient_retries: dict[str, int] = {}
         self._transient_lock = threading.Lock()
+        self._folder_cache: list[str] | None = None
+        self._folder_cache_time: float = 0.0
+        self._folder_cache_lock = threading.Lock()
+
+    def _get_existing_folders(self) -> list[str]:
+        with self._folder_cache_lock:
+            now = time.monotonic()
+            stale = self._folder_cache is None or (now - self._folder_cache_time) > FOLDER_CACHE_TTL_SECONDS
+            if stale:
+                self._folder_cache = self.webdav.list_folders_recursive(self.config.dokumente_webdav_root)
+                self._folder_cache_time = now
+            return list(self._folder_cache)
+
+    def _remember_folder(self, folder: str) -> None:
+        """Make a just-created (or just-confirmed) folder visible to the next
+        classification immediately, without waiting for the cache TTL."""
+        with self._folder_cache_lock:
+            if self._folder_cache is not None and folder not in self._folder_cache:
+                self._folder_cache.append(folder)
 
     def close(self) -> None:
         self.webdav.close()
@@ -169,7 +195,7 @@ class Pipeline:
             confidence = 0.0
             tags += [depotlog.TAG_OCR_FAILED, depotlog.TAG_UNSORTED]
         else:
-            existing_folders = self.webdav.list_folders_recursive(cfg.dokumente_webdav_root)
+            existing_folders = self._get_existing_folders()
             result, classifier_tags = classifier.classify(
                 ocr_text=ocr_result.text,
                 original_filename=original_name,
@@ -194,6 +220,7 @@ class Pipeline:
             tags.append(depotlog.TAG_DATE_UNCERTAIN)
 
         self.webdav.mkcol(target_folder)
+        self._remember_folder(target_folder)
         desired_name = naming.build_filename(title, issue_date, today, ext=ext)
         existing_names = {
             e.path.rsplit("/", 1)[-1]

@@ -23,31 +23,39 @@ def _result(**overrides) -> ClassificationResult:
     return ClassificationResult.model_validate(data)
 
 
-def test_adjust_confidence_trusts_valid_existing_folder():
+def test_resolve_folder_trusts_valid_existing_folder():
     result = _result(folder="Gesundheit/Krankenkasse", is_new_folder=False, confidence=0.9)
-    confidence, tags = classifier._adjust_confidence(result, EXISTING_FOLDERS)
-    assert confidence == 0.9
+    resolved, tags = classifier._resolve_folder(result, EXISTING_FOLDERS)
+    assert resolved.confidence == 0.9
+    assert resolved.folder == "Gesundheit/Krankenkasse"
+    assert resolved.is_new_folder is False
     assert tags == []
 
 
-def test_adjust_confidence_zeroes_hallucinated_folder():
+def test_resolve_folder_zeroes_hallucinated_folder():
     result = _result(folder="Erfundener/Ordner", is_new_folder=False, confidence=0.95)
-    confidence, tags = classifier._adjust_confidence(result, EXISTING_FOLDERS)
-    assert confidence == 0.0
+    resolved, tags = classifier._resolve_folder(result, EXISTING_FOLDERS)
+    assert resolved.confidence == 0.0
     assert "HALLUCINATED-FOLDER" in tags
 
 
-def test_adjust_confidence_downgrades_near_duplicate_new_folder():
+def test_resolve_folder_redirects_near_duplicate_new_folder_to_existing():
     result = _result(folder="Motorrad/Rechnung", is_new_folder=True, confidence=0.9)
-    confidence, tags = classifier._adjust_confidence(result, EXISTING_FOLDERS)
-    assert confidence <= 0.4
-    assert any("SIMILAR-FOLDER-EXISTS" in t for t in tags)
+    resolved, tags = classifier._resolve_folder(result, EXISTING_FOLDERS)
+    # Confidence is kept as-is (not downgraded) since the file is actually
+    # filed under the existing folder, not dumped to a fallback.
+    assert resolved.confidence == 0.9
+    assert resolved.folder == "Motorrad/Rechnungen"
+    assert resolved.is_new_folder is False
+    assert any("AUTO-REDIRECTED" in t for t in tags)
 
 
-def test_adjust_confidence_keeps_genuinely_new_folder():
+def test_resolve_folder_keeps_genuinely_new_folder():
     result = _result(folder="Versicherung/KFZ", is_new_folder=True, confidence=0.8)
-    confidence, tags = classifier._adjust_confidence(result, EXISTING_FOLDERS)
-    assert confidence == 0.8
+    resolved, tags = classifier._resolve_folder(result, EXISTING_FOLDERS)
+    assert resolved.confidence == 0.8
+    assert resolved.folder == "Versicherung/KFZ"
+    assert resolved.is_new_folder is True
     assert tags == []
 
 

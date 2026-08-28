@@ -13,9 +13,9 @@ log = logging.getLogger(__name__)
 
 MAX_OCR_CHARS = 3500
 
-# Above this similarity ratio, a proposed new folder is treated as a likely
-# near-duplicate of an existing one (e.g. "Rechnung" vs "Rechnungen") and its
-# confidence is downgraded rather than trusted outright.
+# Above this similarity ratio, a proposed folder is treated as referring to an
+# already-existing one (e.g. "Rechnung" vs "Rechnungen") and gets redirected
+# there automatically instead of creating a near-duplicate or falling back.
 NEAR_DUPLICATE_THRESHOLD = 0.85
 
 _SYSTEM_PROMPT = """\
@@ -32,10 +32,14 @@ der bestehenden Ordner passen (z.B. Grossschreibung, Singular/Plural-Konvention)
 exakt in der Schreibweise wie in der Ordnerliste unten, z.B. \
 "Dokumente/Gesundheit/Krankenkasse" oder "Dokumente/Motorrad/Rechnungen". \
 Ein neu vorgeschlagener Ordner muss ebenfalls mit "Dokumente/" beginnen.
-- "title" ist ein kurzer, praegnanter Titel ohne Datum und ohne Dateiendung, \
-z.B. "Stromrechnung Juli" oder "Bussgeldbescheid".
+- "title" ist NUR ein kurzer, praegnanter Titel ohne Datum, ohne Dateiendung \
+und ohne Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli" oder \
+"Bussgeldbescheid". Referenznummern gehoeren NIEMALS in den Titel.
 - "issue_date" ist das Ausstellungs-/Rechnungsdatum des Dokuments im Format \
-YYYY-MM-DD, oder null falls nicht ermittelbar.
+YYYY-MM-DD, oder null falls nicht ermittelbar. Deutsche Datumsangaben im Text \
+sind TT.MM.JJJJ (Tag zuerst) - wandle sie sorgfaeltig um, ohne Ziffern zu \
+vertauschen. Beispiel: "31.07.2026" im Text bedeutet issue_date "2026-07-31" \
+(Jahr-Monat-Tag), NICHT "3107-07-20" oder aehnliche Vertauschungen.
 - "confidence" ist deine eigene Einschaetzung (0.0-1.0), wie sicher du bei \
 Ordner UND Titel bist. Sei ehrlich niedrig, wenn der Text schlecht lesbar \
 oder mehrdeutig ist.
@@ -65,28 +69,48 @@ Erkannter Text (OCR, ggf. gekuerzt):
     ]
 
 
-def _adjust_confidence(result: ClassificationResult, existing_folders: list[str]) -> tuple[float, list[str]]:
-    """Cross-checks the model's self-reported confidence against facts it
-    cannot be trusted to judge itself. Returns (adjusted_confidence, tags)."""
+def _resolve_folder(result: ClassificationResult, existing_folders: list[str]) -> tuple[ClassificationResult, list[str]]:
+    """Cross-checks the model's folder choice against the real folder listing,
+    which it cannot be trusted to get exactly right on its own:
+
+    - If it named a real, existing folder: trust it (regardless of whether it
+      thought that folder was "new").
+    - If not, but a real folder has a near-identical name (e.g. it proposed
+      creating "Rechnung" when "Rechnungen" already exists): redirect to the
+      existing one instead of creating a near-duplicate or bailing out to the
+      fallback folder. This is filed automatically like any other match; the
+      redirect is recorded as a log tag so it can be spot-checked later.
+    - If it claimed an existing folder that doesn't resemble anything real:
+      that's an unreliable hallucination, so confidence is zeroed and it
+      falls back to the configured fallback folder instead.
+
+    Returns the (possibly updated) result plus tags for the log.
+    """
     tags: list[str] = []
+    folder = result.folder
+    is_new_folder = result.is_new_folder
     confidence = result.confidence
 
-    if not result.is_new_folder and result.folder not in existing_folders:
-        log.warning(
-            "Model claimed existing folder %r but it is not in the live listing; "
-            "treating as unreliable.",
-            result.folder,
-        )
-        tags.append("HALLUCINATED-FOLDER")
-        confidence = 0.0
-
-    if result.is_new_folder:
-        match = closest_existing_leaf(result.folder, existing_folders)
+    if folder in existing_folders:
+        is_new_folder = False
+    else:
+        match = closest_existing_leaf(folder, existing_folders)
         if match is not None and match[1] >= NEAR_DUPLICATE_THRESHOLD:
-            tags.append(f"SIMILAR-FOLDER-EXISTS? ({match[0]})")
-            confidence = min(confidence, 0.4)
+            tags.append(f"AUTO-REDIRECTED (vorgeschlagen: {folder} -> genutzt: {match[0]})")
+            folder = match[0]
+            is_new_folder = False
+        elif not is_new_folder:
+            log.warning(
+                "Model claimed existing folder %r but it is not in the live listing "
+                "and nothing close matches; treating as unreliable.",
+                folder,
+            )
+            tags.append("HALLUCINATED-FOLDER")
+            confidence = 0.0
+        # else: is_new_folder=True with no close match -> genuine new folder, kept as-is.
 
-    return confidence, tags
+    updated = result.model_copy(update={"folder": folder, "is_new_folder": is_new_folder, "confidence": confidence})
+    return updated, tags
 
 
 def classify(
@@ -119,6 +143,5 @@ def classify(
     except (json.JSONDecodeError, ValidationError) as exc:
         raise RuntimeError(f"Model returned invalid classification JSON: {exc}") from exc
 
-    adjusted_confidence, tags = _adjust_confidence(result, existing_folders)
-    result = result.model_copy(update={"confidence": adjusted_confidence})
+    result, tags = _resolve_folder(result, existing_folders)
     return result, tags
