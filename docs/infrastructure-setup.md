@@ -105,10 +105,13 @@ Ollama-HTTP-API und muss dafür nicht verändert werden.
   mehr) sequenziell über 32 → 33 auf **34** aktualisiert (Nextcloud erlaubt keine
   Versions-Sprünge). Vorher wurde ein vollständiges Backup (Daten + Datenbank) erstellt.
 - WebDAV-Basis-URL: `https://nextcloud.avernus.cloud/remote.php/dav/files/vault-boy`
-- Host-Mount des gesamten Webroots: `/mnt/tank/cloud` → `/var/www/html` im Container.
-  Die eigentlichen Nutzerdateien liegen darunter unter Nextclouds Standard-Layout:
-  `/mnt/tank/cloud/data/vault-boy/files/...` — das ist der Pfad, der DEPOT read-only
-  gemountet wird.
+- Host-Mount des Webroots: `/mnt/tank/cloud` → `/var/www/html` im Container. **Wichtig:**
+  Das Datenverzeichnis wird davon durch einen eigenen, spezifischeren Mount überlagert:
+  `/mnt/tank/applications/nextcloud-user-data` → `/var/www/html/data` (bestätigt per
+  `occ config:system:get datadirectory` und `docker inspect`). Die eigentlichen
+  Nutzerdateien liegen also unter `/mnt/tank/applications/nextcloud-user-data/vault-boy/files/...`
+  — **nicht** unter `/mnt/tank/cloud/data/...` wie man vom generischen Webroot-Mount
+  naiv annehmen würde. Das ist der Pfad, der DEPOT read-only gemountet wird.
 - Der Eingangsordner heißt beim Nutzer exakt **"Scan Eingang"** (mit Leerzeichen, nicht
   "Scan-Eingang" wie im ursprünglichen Plan als Beispielname verwendet) — wichtig für
   `SCAN_EINGANG_LOCAL_PATH`/`SCAN_EINGANG_WEBDAV_PATH` in der `.env`.

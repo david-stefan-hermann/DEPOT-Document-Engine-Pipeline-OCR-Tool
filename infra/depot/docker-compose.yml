@@ -4,7 +4,7 @@ services:
       context: https://github.com/david-stefan-hermann/DEPOT-Document-Engine-Pipeline-OCR-Tool.git#master
     restart: unless-stopped
     volumes:
-      - /mnt/tank/cloud/data/vault-boy/files:/nextcloud-data:ro
+      - /mnt/tank/applications/nextcloud-user-data/vault-boy/files:/nextcloud-data:ro
       - depot-scratch:/scratch
     env_file:
       - .env
