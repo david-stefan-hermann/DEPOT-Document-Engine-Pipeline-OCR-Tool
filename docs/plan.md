@@ -1,0 +1,202 @@
+# DEPOT — Automatisierte Dokumenten-Ablage-Pipeline für Nextcloud
+
+## Context
+
+Der Nutzer sammelt physische Post (Rechnungen, Behördenbriefe, Gehaltsabrechnungen,
+Versicherungsunterlagen, Motorrad-Rechnungen, Bußgeldbescheide etc.) und scannt sie in
+unregelmäßigen Abständen batchweise in einen `Scan-Eingang`-Ordner in seiner
+selbstgehosteten Nextcloud (TrueNAS Scale, Docker, WebDAV-Zugriff). Danach durchläuft er
+für **jeden** Scan manuell: Inhalt lesen, Ausstellungsdatum ermitteln, Datei sinnvoll
+umbenennen, den passenden (mehrere Ebenen tiefen) Unterordner in der bereits gut
+gepflegten `Dokumente/`-Struktur suchen oder neu anlegen, Datei dort ablegen. Das ist bei
+größeren Batches mühsam und zeitintensiv.
+
+Ziel ist eine schlanke, DIY-taugliche Automatisierung (kein Paperless-ngx o.ä., da diese
+Systeme eine eigene feste Ablagestruktur erzwingen statt in eine bestehende,
+organisch gewachsene Struktur einzusortieren). Sensible Dokumente (Gesundheit, Gehalt)
+dürfen das eigene Netz nicht verlassen — Klassifikation läuft daher zwingend über ein
+lokal gehostetes LLM (Ollama).
+
+**Wichtige Randbedingung, die die Architektur geprägt hat:** Die ursprünglich verfügbare
+GPU auf dem TrueNAS-Server war eine GTX 960 (2–4 GB VRAM, alte Maxwell-Architektur) — zu
+schwach für ein Vision-LLM, das Scans direkt liest. Deshalb: klassisches OCR (Tesseract)
+läuft auf der CPU, ein kleines lokales Text-LLM (nicht Vision) übernimmt nur die
+Klassifikation anhand des erkannten Texts. (Siehe [infrastructure-setup.md](infrastructure-setup.md)
+für den späteren Verlauf der GPU-Frage inkl. Kartentausch auf eine GTX 1060.)
+
+Im Gespräch mit dem Nutzer wurde die ursprünglich vorgesehene Review-Zwischenstufe
+verworfen: Es gibt **keinen** Review-Bereich. Dateien werden vollautomatisch direkt in die
+echte `Dokumente/`-Struktur einsortiert; als Sicherheitsnetz dient stattdessen eine
+laufend aktualisierte Logdatei, die der Nutzer im Nachgang durchsehen kann, um
+Fehlzuordnungen manuell in Nextcloud zu korrigieren.
+
+## Bestätigte Entscheidungen (aus Rückfragen mit dem Nutzer)
+
+- **Scan-Struktur:** 1 Datei = 1 Dokument (keine Trennung nötig), Formate gemischt
+  (PDF, teils mehrseitig, sowie JPG/PNG/TIFF).
+- **OCR:** Tesseract + Preprocessing (nicht Vision-LLM), CPU-basiert, deutsches
+  Sprachpaket. Ein kleines Text-LLM (Ollama) übernimmt ausschließlich die
+  Klassifikationsentscheidung.
+- **Trigger:** vollautomatisch per Datei-Watcher auf `Scan-Eingang`.
+- **Umgebung:** Docker-Container auf dem TrueNAS-Server selbst, neben Nextcloud.
+- **Ordnerstruktur-Abfrage:** live per WebDAV bei jedem Lauf (kein Cache).
+- **Kein Review-Bereich:** direkte Einsortierung + Logdatei `DEPOT Dateilog
+  DD-MM-YYYY.txt` in `Scan-Eingang`, die täglich neu benannt und bei jeder Einsortierung
+  ergänzt wird. Der Watcher/Scanner ignoriert jede Datei, deren Name "DEPOT Dateilog"
+  enthält.
+- **Dateiname als Signal:** ein vom Nutzer bereits vergebener Dateiname fließt zusätzlich
+  zum OCR-Text in die Klassifikationsentscheidung ein.
+- **Unsichere Fälle:** landen in einem Fallback-Ordner `Dokumente/Unsortiert`, deutlich im
+  Log markiert.
+- **Neue Ordner:** werden automatisch nach dem Namensmuster bestehender Ordner angelegt,
+  aber im Log besonders hervorgehoben, damit der Nutzer sie kurz gegenprüfen kann.
+
+## Architektur / Datenfluss
+
+```
+Scan-Eingang (Nextcloud-Datenverzeichnis, read-only Bind-Mount für schnellen Lesezugriff)
+   │
+   ▼
+watcher.py (watchdog Observer, on_created/on_moved + Startup-Sweep bei Container-Start)
+   │  - ignoriert Dateinamen, die "DEPOT Dateilog" enthalten
+   │  - ignoriert nicht-whitelisted Dateiendungen (.pdf .jpg .jpeg .png .tif .tiff)
+   │  - Debounce: wartet bis Dateigröße ~2s stabil ist (Scanner schreiben inkrementell)
+   ▼
+pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
+   │
+   ├─► ocr.py: Bilder → img2pdf → ocrmypdf --language deu --deskew --clean
+   │           --rotate-pages --sidecar text.txt  (ein einheitlicher Codepfad für
+   │           PDF und Bild). Qualitätscheck: bei zu wenig erkanntem Text Retry mit
+   │           --force-ocr, danach ggf. OCR_FAILED → Fallback mit Konfidenz 0.
+   │
+   ├─► webdav.py: PROPFIND auf Dokumente/ (Depth:1 rekursiv, da Nextcloud kein
+   │           Depth:infinity erlaubt) → aktuelle flache Liste aller Unterordner
+   │
+   ├─► classifier.py: Prompt aus OCR-Text (gekürzt, Datum/Titel stehen fast immer auf
+   │           Seite 1), ursprünglichem Dateinamen und aktueller Ordnerliste →
+   │           Ollama-Chat-Aufruf mit striktem JSON-Schema → pydantic-validiertes
+   │           Ergebnis {folder, is_new_folder, title, issue_date, confidence, reasoning}.
+   │           Konfidenz wird zusätzlich serverseitig heruntergestuft bei
+   │           halluzinierten Ordnerpfaden oder Ordnernamen, die bestehenden stark
+   │           ähneln (Fuzzy-Match), um Beinahe-Duplikate zu vermeiden.
+   │
+   ├─► naming.py: Titel sanitizen, Datum validieren, Dateiname
+   │           "YYYY-MM-DD Titel.ext" bauen, Kollisionen auflösen ("(2)", "(3)", …)
+   │
+   ├─► webdav.py: MKCOL (falls neuer Ordner) + PUT/DELETE (neue durchsuchbare PDF
+   │           hochladen, Original löschen) — alle Schreiboperationen laufen
+   │           ausschließlich über WebDAV, NICHT über den Bind-Mount, damit Nextclouds
+   │           interner File-Cache synchron bleibt (direkte Dateisystem-Schreibzugriffe
+   │           erzeugen sonst unsichtbare "Ghost-Dateien" bis ein manueller
+   │           `occ files:scan` läuft)
+   │
+   └─► depotlog.py: Eintrag in Scan-Eingang/DEPOT Dateilog DD-MM-YYYY.txt anhängen,
+               inkl. Sondermarkierung für [OCR-FEHLGESCHLAGEN], [UNSORTIERT] und
+               [NEUER-ORDNER]-Fälle
+```
+
+## Tech-Stack
+
+- **Python 3.12** im Docker-Container.
+- `watchdog` — Dateisystem-Events.
+- `ocrmypdf` (kapselt tesseract, unpaper, ghostscript, qpdf) + `img2pdf` für lose
+  Bilddateien → ein einziger Codepfad für alle Dateitypen.
+- System-Pakete im Image: `tesseract-ocr`, `tesseract-ocr-deu`, `ghostscript`, `unpaper`,
+  `qpdf`.
+- `pymupdf` — schneller Check, ob ein PDF schon eine Textebene hat, sowie Seitenzählung.
+- `httpx` + `xml.etree.ElementTree` — schlanker, selbstgeschriebener WebDAV-Client
+  (PROPFIND/MKCOL/PUT/GET/DELETE/MOVE); bewusst keine vollwertige WebDAV-Library, passt
+  zum Wunsch nach wenig Abhängigkeiten.
+- `ollama` (offizieller Python-Client) — Chat-Aufruf mit JSON-Schema-Format.
+- `pydantic` — Schema-Validierung der LLM-Antwort.
+- `pathvalidate` — Dateiname-Sanitizing (Umlaute bleiben erhalten, nur echte
+  Sonderzeichen wie `/ \ : * ? " < > |` werden entfernt).
+- stdlib `sqlite3` — kleine lokale Statusverfolgung (Fehlversuche pro Datei), um nach 3
+  permanenten Fehlversuchen automatisch in einen Fehlerordner zu quarantänisieren
+  (transiente Fehler wie Ollama/WebDAV nicht erreichbar zählen nicht mit).
+
+Empfohlenes Modell: `qwen2.5:7b-instruct-q4_K_M` (starkes Deutsch). Läuft anfangs
+CPU-only auf dem TrueNAS-Server; siehe [infrastructure-setup.md](infrastructure-setup.md)
+für den aktuellen Stand zu GPU-Beschleunigung.
+
+## Dateiname-Konvention
+
+`YYYY-MM-DD Titel.ext`, z.B. `2026-07-15 Stromrechnung Juli.pdf`. Fehlt ein erkennbares
+Datum, wird das Verarbeitungsdatum verwendet, der Titel erhält den Zusatz
+"(Datum unsicher)" und der Logeintrag wird mit `[DATE-UNCERTAIN]` markiert.
+
+## Repo-Struktur
+
+```
+DEPOT-Document-Engine-Pipeline-OCR-Tool/
+  Dockerfile
+  docker-compose.yml
+  requirements.txt
+  .env.example
+  run.py
+  depot/
+    config.py       # Env-Loading, dataclass
+    watcher.py       # watchdog + Startup-Sweep + Debounce + Queue
+    pipeline.py      # Verarbeitung pro Datei
+    ocr.py           # img2pdf/ocrmypdf-Wrapper, Qualitätscheck
+    webdav.py        # PROPFIND / MKCOL / PUT / GET / DELETE / MOVE, httpx-basiert
+    classifier.py    # Prompt-Bau, Ollama-Aufruf, Konfidenz-Logik
+    naming.py        # Sanitizing, Datumsparsing, Kollisionen, Fuzzy-Ordner-Match
+    depotlog.py      # Dateilog-TXT-Writer/Rotation
+    state.py         # sqlite Fehlversuch-Tracker
+    models.py        # pydantic-Schema
+  tests/
+    conftest.py       # Fake-Nextcloud-WebDAV-Server für Tests
+    test_*.py
+  infra/
+    ollama/
+      docker-compose.yml  # Ollama-Stack für Dockge auf dem TrueNAS-Server
+  docs/
+    plan.md                  # dieses Dokument
+    infrastructure-setup.md  # TrueNAS/Ollama/GPU-Setup-Verlauf und Entscheidungen
+```
+
+**Kritische Dateien für die Umsetzung:** `depot/pipeline.py`, `depot/ocr.py`,
+`depot/classifier.py`, `depot/webdav.py`, `docker-compose.yml`.
+
+## Edge Cases
+
+- **Korrupte/unlesbare Datei:** Exception in `ocr.py` abfangen, `[ERROR]` loggen,
+  Fehlversuchszähler erhöhen, nach 3 Versuchen nach `_Fehlerhaft` quarantänisieren.
+- **Nicht unterstützter Dateityp:** Endungs-Whitelist, sonst `[SKIPPED-UNSUPPORTED]`
+  loggen und unangetastet lassen.
+- **Fast leerer OCR-Text:** erzwungene Konfidenz 0, Fallback nach `Unsortiert`,
+  `[OCR-FEHLGESCHLAGEN]` im Log.
+- **Ollama nicht erreichbar/Timeout:** ~120s Timeout, ein Retry mit Backoff, danach
+  transienter Fallback (zählt nicht zum permanenten Fehlerlimit, wird stattdessen
+  automatisch requeued).
+- **WebDAV-Auth-Fehler:** Connectivity-Check beim Start, klarer Fehlschlag mit Log.
+- **Ordner-Kollisionen/Fast-Duplikate:** Fuzzy-Match neuer Ordnervorschläge gegen
+  bestehende Blätter, Konfidenz herabsetzen statt stillschweigend anzulegen.
+- **Nicht-ASCII-Dateinamen:** NFC-Normalisierung vor jedem Vergleich/WebDAV-Pfad.
+- **Große Batches:** eine `queue.Queue` + feste Worker-Zahl (Default 1), um CPU
+  (Tesseract) und LLM (Ollama) auf bescheidener Hardware nicht zu überlasten.
+
+## Verifikation / Testplan
+
+1. `tests/fixtures/` mit ~10 repräsentativen Beispielen aufbauen, bevor der Watcher auf
+   den echten `Scan-Eingang` zeigt: saubere PDF-Rechnung, schräg fotografierter JPG-Scan,
+   verrauschter alter Behördenbrief, mehrseitiges PDF, nahezu leerer/fehlgeschlagener
+   Scan, PDF mit bereits vorhandener Textebene, ein vorab umbenanntes Bild (testet den
+   Dateiname-Signalpfad), ein Fall, der sinnvoll einen neuen Ordner auslösen sollte, ein
+   Fall, der sinnvoll in `Unsortiert` landen sollte, ein ausgeschriebenes deutsches Datum.
+2. Diese Beispiele durch `ocr.py` + `classifier.py` gegen eine echte lokale
+   Ollama-Instanz laufen lassen, aber mit einer statischen `folder_tree.json`-Fixture
+   (nicht live WebDAV) für schnelle, wiederholbare Durchläufe.
+3. Harte Asserts für mechanische Korrektheit (nicht-leerer OCR-Text,
+   Schema-Validierung, Dateiname-Sanitizing, Datumsparsing); manuell durchgesehene
+   Diff-Tabelle für die naturgemäß unscharfe Klassifikationsqualität.
+4. Erst danach den Watcher auf den echten `Scan-Eingang` ansetzen — zunächst mit
+   `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
+   ein bis zwei Batches.
+
+Umgesetzt wurde bereits eine Offline-Testsuite (57 Tests) für alle Module, die ohne
+echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
+Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
+beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur
+Verfügung stehen.

@@ -1,0 +1,18 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - /mnt/tank/applications/ollama:/root/.ollama
+    # Spaeter aktivieren, sobald GPU-Treiber-Support geklaert ist
+    # (siehe docs/infrastructure-setup.md):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

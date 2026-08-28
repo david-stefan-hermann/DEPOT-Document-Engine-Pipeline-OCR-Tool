@@ -10,26 +10,6 @@ services:
       - depot-scratch:/scratch
     env_file:
       - .env
-    depends_on:
-      - ollama
-
-  # Remove this service if Ollama already runs elsewhere on the box; just
-  # point OLLAMA_HOST in .env at it instead.
-  ollama:
-    image: ollama/ollama:latest
-    restart: unless-stopped
-    volumes:
-      - ollama-data:/root/.ollama
-    # Uncomment if the NVIDIA Container Toolkit is installed on the TrueNAS
-    # host and you want the GTX 960 used for the classification model:
-    # deploy:
-    #   resources:
-    #     reservations:
-    #       devices:
-    #         - driver: nvidia
-    #           count: 1
-    #           capabilities: [gpu]
 
 volumes:
   depot-scratch:
-  ollama-data:
