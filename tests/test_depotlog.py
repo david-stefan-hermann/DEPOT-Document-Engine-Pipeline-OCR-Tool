@@ -75,3 +75,45 @@ def test_append_without_path_has_no_trailing_pipe(client):
     text = client.get("Scan-Eingang/DEPOT Dateilog 28-08-2026.txt").decode("utf-8")
     line = [l for l in text.splitlines() if l.strip()][0]
     assert not line.rstrip().endswith("|")
+
+
+def test_append_recovers_from_transient_write_failure(monkeypatch, client):
+    import depot.depotlog as depotlog_module
+
+    monkeypatch.setattr(depotlog_module, "_WRITE_RETRY_DELAY_SECONDS", 0.01)
+
+    log = DepotLog(client, "Scan-Eingang", "DEPOT Dateilog")
+    real_put = client.put
+    calls = {"n": 0}
+
+    def flaky_put(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] < 2:
+            raise RuntimeError("423 Locked")
+        return real_put(*args, **kwargs)
+
+    monkeypatch.setattr(client, "put", flaky_put)
+
+    log.append("scan1.pdf", "confidence=0.90", on_date=date(2026, 8, 28))  # must not raise
+
+    text = client.get("Scan-Eingang/DEPOT Dateilog 28-08-2026.txt").decode("utf-8")
+    assert "scan1.pdf" in text
+    assert calls["n"] == 2
+
+
+def test_append_gives_up_gracefully_without_raising(monkeypatch, client):
+    import depot.depotlog as depotlog_module
+
+    monkeypatch.setattr(depotlog_module, "_WRITE_RETRY_DELAY_SECONDS", 0.01)
+
+    log = DepotLog(client, "Scan-Eingang", "DEPOT Dateilog")
+
+    def always_locked(*args, **kwargs):
+        raise RuntimeError("423 Locked")
+
+    monkeypatch.setattr(client, "put", always_locked)
+
+    # Must not raise, even though every write attempt fails - a document that
+    # was already successfully filed must not be treated as a failure just
+    # because the audit-log entry couldn't be written.
+    log.append("scan1.pdf", "confidence=0.90", on_date=date(2026, 8, 28))

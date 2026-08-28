@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import logging
+import time
 from datetime import date, datetime
 
 from depot.webdav import WebDavClient
+
+log = logging.getLogger(__name__)
 
 TAG_OCR_FAILED = "OCR-FEHLGESCHLAGEN"
 TAG_UNSORTED = "UNSORTIERT"
@@ -11,6 +15,14 @@ TAG_DATE_UNCERTAIN = "DATUM-UNSICHER"
 TAG_ERROR = "FEHLER"
 TAG_QUARANTINED = "FEHLER-QUARANTAENE"
 TAG_SKIPPED = "UEBERSPRUNGEN"
+
+# The log write is a best-effort side channel, not part of the actual filing
+# operation (which has already completed by the time append() is called). A
+# transient write failure here (e.g. the user has the log file open in
+# Nextcloud's editor and it's briefly locked) must never be treated as a
+# pipeline failure for an already-successfully-filed document.
+_WRITE_RETRIES = 3
+_WRITE_RETRY_DELAY_SECONDS = 2.0
 
 
 def is_log_file(filename: str, prefix: str) -> bool:
@@ -54,5 +66,22 @@ class DepotLog:
         line = f"{timestamp} | {original_filename} | {message}{tag_str}{path_str}\n"
 
         rel_path = self._rel_path(on_date)
-        existing = self._webdav.get(rel_path) or b""
-        self._webdav.put(rel_path, existing + line.encode("utf-8"))
+
+        for attempt in range(1, _WRITE_RETRIES + 1):
+            try:
+                existing = self._webdav.get(rel_path) or b""
+                self._webdav.put(rel_path, existing + line.encode("utf-8"))
+                return
+            except Exception as exc:
+                if attempt < _WRITE_RETRIES:
+                    log.warning(
+                        "Log write to %s failed (attempt %d/%d, retrying): %s",
+                        rel_path, attempt, _WRITE_RETRIES, exc,
+                    )
+                    time.sleep(_WRITE_RETRY_DELAY_SECONDS)
+                else:
+                    log.error(
+                        "Giving up writing log entry to %s after %d attempts: %s. "
+                        "Entry that could not be written: %r",
+                        rel_path, _WRITE_RETRIES, exc, line,
+                    )
