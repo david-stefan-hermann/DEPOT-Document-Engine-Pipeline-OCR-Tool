@@ -20,16 +20,40 @@ def test_valid_result_parses():
     assert result.issue_date.isoformat() == "2026-03-05"
 
 
-def test_confidence_out_of_range_rejected():
-    with pytest.raises(ValidationError):
-        ClassificationResult.model_validate(
-            {
-                "folder": "X",
-                "is_new_folder": False,
-                "title": "Y",
-                "confidence": 1.5,
-            }
-        )
+def test_confidence_percentage_int_is_rescaled():
+    result = ClassificationResult.model_validate(
+        {
+            "folder": "X",
+            "is_new_folder": False,
+            "title": "Y",
+            "confidence": 95,
+        }
+    )
+    assert result.confidence == 0.95
+
+
+def test_confidence_wildly_out_of_range_is_clamped():
+    result = ClassificationResult.model_validate(
+        {
+            "folder": "X",
+            "is_new_folder": False,
+            "title": "Y",
+            "confidence": 500,
+        }
+    )
+    assert result.confidence == 1.0
+
+
+def test_confidence_negative_is_clamped():
+    result = ClassificationResult.model_validate(
+        {
+            "folder": "X",
+            "is_new_folder": False,
+            "title": "Y",
+            "confidence": -0.2,
+        }
+    )
+    assert result.confidence == 0.0
 
 
 def test_missing_issue_date_is_none():

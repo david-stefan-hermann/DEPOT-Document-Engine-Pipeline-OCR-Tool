@@ -24,6 +24,17 @@ class ClassificationResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ""
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: float | int) -> float:
+        # Small models occasionally answer with a 0-100 percentage instead of
+        # the requested 0.0-1.0 scale (e.g. 95 meaning "95%"). Rescale rather
+        # than hard-failing the whole classification over a formatting slip.
+        if isinstance(v, (int, float)) and v > 1:
+            log.warning("Model returned confidence=%r outside 0-1; treating as a percentage.", v)
+            v = v / 100
+        return max(0.0, min(1.0, float(v)))
+
     @field_validator("folder")
     @classmethod
     def _strip_folder(cls, v: str) -> str:
