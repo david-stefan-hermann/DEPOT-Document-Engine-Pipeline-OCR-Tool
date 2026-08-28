@@ -110,16 +110,13 @@ ohne beobachtetes Problem — bei tatsächlich spürbarer Verlangsamung anderer 
 eines Batch-Laufs kann `deploy.resources.limits.cpus` in der Compose-Datei nachgerüstet
 werden.
 
-## GPU-Treiber-Build (Stand: läuft, noch nicht final installiert)
-
-Aktueller Fortschritt beim Nachrüsten der GPU-Beschleunigung (siehe "GPU-Verlauf" oben
-für den vollen Weg dahin):
+## GPU-Treiber-Build (Status: erledigt, GPU läuft)
 
 1. Build mit [kaemis02/truenas-nvidia-extension](https://github.com/kaemis02/truenas-nvidia-extension)
    auf einer Windows-WSL2-Ubuntu-Umgebung (nicht auf dem TrueNAS-Server) erfolgreich
    durchgeführt — Ausgabe: `out-25.10.4/nvidia.raw`.
 2. Datei per `scp` nach `/tmp/nvidia.raw` auf den TrueNAS-Server übertragen.
-3. **Noch offen:** Installation auf dem Server selbst, laut Projekt-README (Option B — CLI):
+3. Installation auf dem Server selbst, laut Projekt-README (Option B — CLI):
    ```
    cp /usr/share/truenas/sysext-extensions/nvidia.raw /root/nvidia.raw.bak
    systemd-sysext unmerge
@@ -131,12 +128,10 @@ für den vollen Weg dahin):
    systemd-sysext status
    nvidia-smi
    ```
-4. **Noch offen:** `nvidia-smi` muss die GTX 1060 zeigen, bevor die GPU-Sektion im
-   Ollama-Compose (siehe unten) sinnvoll aktiviert werden kann.
-5. Aufräumen nach den fehlgeschlagenen Host-seitigen Build-Versuchen:
-   `rm -rf /mnt/tank/applications/nvidia-build` auf dem TrueNAS-Server (mehrere GB
-   gecachtes TrueNAS-Update-Image + entpacktes Rootfs vom verworfenen Versuch, den Build
-   direkt auf dem Server auszuführen).
+4. **Bestätigt funktionierend:** `nvidia-smi` zeigt die GTX 1060 6GB korrekt (Treiber
+   570.172.08, CUDA 12.8). Die GPU-Sektion im Ollama-Compose (siehe unten) ist aktiv.
+5. Aufräumen nach den fehlgeschlagenen Host-seitigen Build-Versuchen erledigt:
+   `rm -rf /mnt/tank/applications/nvidia-build` auf dem TrueNAS-Server ausgeführt.
 
 **Nach jedem TrueNAS-Update, das den Kernel ändert:** `generate.sh` mit aktualisierter
 `TRUENAS_VERSION`/`TRUENAS_TAG` erneut laufen lassen und neu installieren — die Extension
@@ -144,8 +139,7 @@ ist kernelversionsgebunden.
 
 ## Wechsel zu GPU (Ollama-Compose)
 
-Sobald `nvidia-smi` auf dem Host die Karte zeigt, reicht es, im Ollama-Compose die
-auskommentierte Sektion zu aktivieren:
+Im Ollama-Compose ist die GPU-Sektion jetzt aktiv:
 ```yaml
     deploy:
       resources:
@@ -155,8 +149,30 @@ auskommentierte Sektion zu aktivieren:
               count: 1
               capabilities: [gpu]
 ```
-und den Stack neu zu deployen. Die DEPOT-Pipeline selbst spricht ausschließlich mit der
-Ollama-HTTP-API und muss dafür nicht verändert werden.
+Die DEPOT-Pipeline selbst spricht ausschließlich mit der Ollama-HTTP-API und musste dafür
+nicht verändert werden.
+
+## Modell-Experimente
+
+- **Qwen2.5 7B Instruct (q4_K_M)** — Standardmodell, funktioniert mit dem hierarchischen
+  Klassifikator (siehe `docs/plan.md`) grundsätzlich, aber nicht perfekt: bei einem
+  Live-Test korrekt in `Dokumente/Behoerden/Wahlen` einsortiert, bei einem anderen
+  Dokument einen nicht existierenden Unterordner erfunden statt den echten zu nehmen
+  (Sicherheitsnetz griff, landete eine Ebene zu flach statt komplett falsch).
+- **Llama 3.1 8B Instruct (q4_K_M)** ausprobiert, da Benchmarks es für strikte
+  JSON-Schema-Einhaltung empfehlen — **Ergebnis: deutlich schlechter** für diese Aufgabe.
+  Hat bei jedem getesteten Dokument sofort auf der Wurzelebene "stay" gewählt (landete
+  direkt in `Dokumente/`, nie in einem Unterordner), mit auffällig identischer Confidence
+  0.80 bei völlig unterschiedlichen Dokumenten — sieht nach einer Art
+  Ausweich-/Standardantwort aus, wenn das Modell mit dem deutschsprachigen
+  Mehrschritt-Prompt nicht klarkommt. **Wieder auf Qwen2.5 zurückgewechselt.**
+- **Offener Punkt für die nächste Session:** Klassifikationsqualität mit Qwen2.5 ist
+  laut Nutzer-Feedback "relativ schlecht" — funktioniert prinzipiell (siehe oben), aber
+  noch nicht zufriedenstellend zuverlässig. Mögliche nächste Schritte, noch nicht
+  entschieden: anderes Modell in der ~6GB-Klasse ausprobieren (z.B. Gemma 2 9B, laut
+  Recherche mit nur 5.7GB VRAM konkurrenzfähig zu 13B-Modellen), Prompt weiter schärfen,
+  oder mit mehr echten Beispieldokumenten systematisch nachtesten statt Einzelfälle zu
+  jagen.
 
 ## Nextcloud
 
