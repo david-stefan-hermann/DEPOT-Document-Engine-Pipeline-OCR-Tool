@@ -20,25 +20,28 @@ def main() -> None:
     config = Config.from_env()
     pipeline = Pipeline(config)
 
-    log.info("Checking WebDAV connectivity to %s ...", config.nextcloud_webdav_url)
-    pipeline.webdav.check_connection()
-    log.info("WebDAV connection OK.")
+    try:
+        log.info("Checking WebDAV connectivity to %s ...", config.nextcloud_webdav_url)
+        pipeline.webdav.check_connection()
+        log.info("WebDAV connection OK.")
 
-    work_queue: "queue.Queue" = queue.Queue()
-    watcher = ScanWatcher(
-        local_path=config.scan_eingang_local_path,
-        supported_extensions=config.supported_extensions,
-        log_file_prefix=config.log_file_prefix,
-        out_queue=work_queue,
-    )
+        work_queue: "queue.Queue" = queue.Queue()
+        watcher = ScanWatcher(
+            local_path=config.scan_eingang_local_path,
+            supported_extensions=config.supported_extensions,
+            log_file_prefix=config.log_file_prefix,
+            out_queue=work_queue,
+        )
 
-    log.info("Running startup sweep of %s ...", config.scan_eingang_local_path)
-    watcher.startup_sweep()
+        log.info("Running startup sweep of %s ...", config.scan_eingang_local_path)
+        watcher.startup_sweep()
 
-    workers = pipeline.run_workers(work_queue)
-    watcher.start()
-
-    stop_event = None
+        workers = pipeline.run_workers(work_queue)
+        watcher.start()
+    except Exception:
+        log.error("Startup failed, exiting.", exc_info=True)
+        pipeline.close()
+        sys.exit(1)
 
     def _handle_signal(signum, frame):
         log.info("Received signal %s, shutting down ...", signum)

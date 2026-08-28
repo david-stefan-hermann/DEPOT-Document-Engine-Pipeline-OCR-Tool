@@ -81,6 +81,11 @@ class ScanWatcher:
                 self._out_queue.put(entry)
 
     def start(self) -> None:
+        if not self._local_path.is_dir():
+            raise RuntimeError(
+                f"Scan-Eingang path does not exist or is not a directory: {self._local_path}. "
+                "Check SCAN_EINGANG_LOCAL_PATH and the bind mount."
+            )
         handler = _Handler(self)
         self._observer.schedule(handler, str(self._local_path), recursive=False)
         self._observer.start()
