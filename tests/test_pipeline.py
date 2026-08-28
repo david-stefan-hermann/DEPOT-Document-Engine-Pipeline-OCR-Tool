@@ -29,6 +29,7 @@ def make_config(tmp_path, **overrides) -> Config:
         ollama_model="fake-model",
         confidence_threshold=0.6,
         log_file_prefix="DEPOT Dateilog",
+        config_file_name="DEPOT Config.json",
         ocr_language="deu",
         max_concurrent_jobs=1,
         state_db_path=str(tmp_path / "state.sqlite3"),
@@ -326,3 +327,18 @@ def test_new_folder_is_immediately_visible_to_next_document(monkeypatch, tmp_pat
 
     assert "Dokumente/Versicherung/KFZ" not in calls[0]
     assert "Dokumente/Versicherung/KFZ" in calls[1]
+
+
+def test_excluded_folders_from_config_file_are_never_offered(tmp_path, pipeline, client):
+    import json
+
+    client.mkcol("Dokumente/Games/Amiibo-main")
+    client.mkcol("Dokumente/Gesundheit")
+    (tmp_path / "DEPOT Config.json").write_text(
+        json.dumps({"excluded_folders": ["Dokumente/Games"]}), encoding="utf-8"
+    )
+
+    folders = pipeline._get_existing_folders()
+
+    assert "Dokumente/Gesundheit" in folders
+    assert not any(f.startswith("Dokumente/Games") for f in folders)

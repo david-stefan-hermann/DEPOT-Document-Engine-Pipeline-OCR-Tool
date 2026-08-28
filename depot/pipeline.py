@@ -9,7 +9,7 @@ from pathlib import Path
 
 import httpx
 
-from depot import classifier, depotlog, naming, ocr
+from depot import classifier, depotlog, naming, ocr, scan_config
 from depot.config import Config
 from depot.depotlog import DepotLog
 from depot.state import StateStore
@@ -67,7 +67,11 @@ class Pipeline:
             now = time.monotonic()
             stale = self._folder_cache is None or (now - self._folder_cache_time) > FOLDER_CACHE_TTL_SECONDS
             if stale:
-                self._folder_cache = self.webdav.list_folders_recursive(self.config.dokumente_webdav_root)
+                folders = self.webdav.list_folders_recursive(self.config.dokumente_webdav_root)
+                excluded = scan_config.load_excluded_folders(
+                    self.config.scan_eingang_local_path, self.config.config_file_name
+                )
+                self._folder_cache = scan_config.filter_excluded(folders, excluded)
                 self._folder_cache_time = now
             return list(self._folder_cache)
 

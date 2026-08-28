@@ -10,6 +10,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from depot.depotlog import is_log_file
+from depot.scan_config import is_config_file
 
 log = logging.getLogger(__name__)
 
@@ -28,11 +29,13 @@ class ScanWatcher:
         local_path: str,
         supported_extensions: frozenset[str],
         log_file_prefix: str,
+        config_file_name: str,
         out_queue: "queue.Queue[Path]",
     ):
         self._local_path = Path(local_path)
         self._supported_extensions = supported_extensions
         self._log_file_prefix = log_file_prefix
+        self._config_file_name = config_file_name
         self._out_queue = out_queue
         self._pending: set[Path] = set()
         self._pending_lock = threading.Lock()
@@ -42,6 +45,8 @@ class ScanWatcher:
         if not path.is_file():
             return False
         if is_log_file(path.name, self._log_file_prefix):
+            return False
+        if is_config_file(path.name, self._config_file_name):
             return False
         return path.suffix.lower() in self._supported_extensions
 

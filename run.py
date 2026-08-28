@@ -30,6 +30,7 @@ def main() -> None:
             local_path=config.scan_eingang_local_path,
             supported_extensions=config.supported_extensions,
             log_file_prefix=config.log_file_prefix,
+            config_file_name=config.config_file_name,
             out_queue=work_queue,
         )
 

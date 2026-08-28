@@ -10,6 +10,7 @@ def _make_watcher(path):
         local_path=str(path),
         supported_extensions=frozenset({".pdf"}),
         log_file_prefix="DEPOT Dateilog",
+        config_file_name="DEPOT Config.json",
         out_queue=queue.Queue(),
     )
 
@@ -36,3 +37,14 @@ def test_startup_sweep_warns_but_does_not_raise_when_path_missing(tmp_path, capl
     watcher = _make_watcher(missing)
 
     watcher.startup_sweep()  # must not raise
+
+
+def test_config_file_is_ignored_by_startup_sweep(tmp_path):
+    (tmp_path / "DEPOT Config.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "scan1.pdf").write_bytes(b"%PDF-1.4")
+    watcher = _make_watcher(tmp_path)
+
+    watcher.startup_sweep()
+
+    queued = [watcher._out_queue.get_nowait().name for _ in range(watcher._out_queue.qsize())]
+    assert queued == ["scan1.pdf"]
