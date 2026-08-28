@@ -6,9 +6,10 @@ import httpx
 import pytest
 
 from depot import classifier, ocr
+from depot.classifier import ClassificationOutcome
 from depot.config import Config
 from depot.depotlog import DepotLog
-from depot.models import ClassificationResult, OcrResult
+from depot.models import OcrResult
 from depot.pipeline import Pipeline
 from depot.state import StateStore
 
@@ -83,7 +84,7 @@ def test_happy_path_files_into_existing_folder(monkeypatch, tmp_path, pipeline, 
     monkeypatch.setattr(
         classifier, "classify",
         lambda **kwargs: (
-            ClassificationResult(
+            ClassificationOutcome(
                 folder="Dokumente/Gesundheit/Krankenkasse",
                 is_new_folder=False,
                 title="Mitgliedsbescheinigung",
@@ -117,7 +118,7 @@ def test_low_confidence_goes_to_fallback(monkeypatch, tmp_path, pipeline, fake_s
     monkeypatch.setattr(
         classifier, "classify",
         lambda **kwargs: (
-            ClassificationResult(folder="Irgendwas", is_new_folder=True, title="Unklar", confidence=0.3),
+            ClassificationOutcome(folder="Irgendwas", is_new_folder=True, title="Unklar", confidence=0.3),
             [],
         ),
     )
@@ -162,7 +163,7 @@ def test_new_folder_is_created_and_tagged(monkeypatch, tmp_path, pipeline, fake_
     monkeypatch.setattr(
         classifier, "classify",
         lambda **kwargs: (
-            ClassificationResult(folder="Dokumente/Motorrad/Ersatzteile", is_new_folder=True, title="Ersatzteilrechnung", confidence=0.85),
+            ClassificationOutcome(folder="Dokumente/Motorrad/Ersatzteile", is_new_folder=True, title="Ersatzteilrechnung", confidence=0.85),
             [],
         ),
     )
@@ -187,7 +188,7 @@ def test_filename_collision_gets_suffix(monkeypatch, tmp_path, pipeline, fake_se
     monkeypatch.setattr(
         classifier, "classify",
         lambda **kwargs: (
-            ClassificationResult(folder="Dokumente/Energie/Rechnungen", is_new_folder=False, title="Stromrechnung", issue_date=date(2026, 7, 15), confidence=0.9),
+            ClassificationOutcome(folder="Dokumente/Energie/Rechnungen", is_new_folder=False, title="Stromrechnung", issue_date=date(2026, 7, 15), confidence=0.9),
             [],
         ),
     )
@@ -305,7 +306,7 @@ def test_new_folder_is_immediately_visible_to_next_document(monkeypatch, tmp_pat
     def fake_classify(**kwargs):
         calls.append(kwargs["existing_folders"])
         return (
-            ClassificationResult(
+            ClassificationOutcome(
                 folder="Dokumente/Versicherung/KFZ",
                 is_new_folder=True,
                 title="Kfz-Versicherung",

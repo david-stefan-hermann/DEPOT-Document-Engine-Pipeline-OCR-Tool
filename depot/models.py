@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, timedelta
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -14,11 +15,20 @@ _MIN_PLAUSIBLE_DATE = date(1900, 1, 1)
 _MAX_FUTURE_BUFFER = timedelta(days=60)
 
 
-class ClassificationResult(BaseModel):
-    """Structured response expected from the local LLM's classification call."""
+def _normalize_confidence_value(v: float | int) -> float:
+    # Small models occasionally answer with a 0-100 percentage instead of
+    # the requested 0.0-1.0 scale (e.g. 95 meaning "95%"). Rescale rather
+    # than hard-failing the whole classification over a formatting slip.
+    if isinstance(v, (int, float)) and v > 1:
+        log.warning("Model returned confidence=%r outside 0-1; treating as a percentage.", v)
+        v = v / 100
+    return max(0.0, min(1.0, float(v)))
 
-    folder: str = Field(min_length=1)
-    is_new_folder: bool
+
+class ContentExtraction(BaseModel):
+    """What the document IS, independent of where it should be filed:
+    title and issue date, extracted from OCR text alone."""
+
     title: str = Field(min_length=1)
     issue_date: date | None = None
     confidence: float = Field(ge=0.0, le=1.0)
@@ -27,18 +37,7 @@ class ClassificationResult(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v: float | int) -> float:
-        # Small models occasionally answer with a 0-100 percentage instead of
-        # the requested 0.0-1.0 scale (e.g. 95 meaning "95%"). Rescale rather
-        # than hard-failing the whole classification over a formatting slip.
-        if isinstance(v, (int, float)) and v > 1:
-            log.warning("Model returned confidence=%r outside 0-1; treating as a percentage.", v)
-            v = v / 100
-        return max(0.0, min(1.0, float(v)))
-
-    @field_validator("folder")
-    @classmethod
-    def _strip_folder(cls, v: str) -> str:
-        return v.strip().strip("/")
+        return _normalize_confidence_value(v)
 
     @field_validator("title")
     @classmethod
@@ -54,6 +53,27 @@ class ClassificationResult(BaseModel):
             log.warning("Model returned an implausible issue_date %s; discarding it.", v)
             return None
         return v
+
+
+class FolderStepDecision(BaseModel):
+    """One step of the level-by-level descent through the Dokumente/ tree:
+    given the current folder's direct children, either go into one of them,
+    stay at the current level, or propose a new child folder here."""
+
+    action: Literal["descend", "stay", "new_folder"]
+    folder_name: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: float | int) -> float:
+        return _normalize_confidence_value(v)
+
+    @field_validator("folder_name")
+    @classmethod
+    def _strip_folder_name(cls, v: str | None) -> str | None:
+        return v.strip().strip("/") if v else None
 
 
 class OcrResult(BaseModel):

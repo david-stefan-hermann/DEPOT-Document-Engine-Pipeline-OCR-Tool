@@ -46,8 +46,32 @@ def test_append_uses_separate_file_per_day(client):
 
 def test_append_includes_tags(client):
     log = DepotLog(client, "Scan-Eingang", "DEPOT Dateilog")
-    log.append("scan1.pdf", "-> Dokumente/Unsortiert/x.pdf", tags=["UNSORTIERT", "OCR-FEHLGESCHLAGEN"], on_date=date(2026, 8, 28))
+    log.append("scan1.pdf", "confidence=0.10", tags=["UNSORTIERT", "OCR-FEHLGESCHLAGEN"], on_date=date(2026, 8, 28))
 
     text = client.get("Scan-Eingang/DEPOT Dateilog 28-08-2026.txt").decode("utf-8")
     assert "UNSORTIERT" in text
     assert "OCR-FEHLGESCHLAGEN" in text
+
+
+def test_append_path_is_always_the_last_thing_on_the_line(client):
+    log = DepotLog(client, "Scan-Eingang", "DEPOT Dateilog")
+    log.append(
+        "scan1.pdf",
+        "confidence=0.90",
+        tags=["NEUER-ORDNER"],
+        path="Dokumente/Energie/Rechnungen/2026-07-15 Stromrechnung.pdf",
+        on_date=date(2026, 8, 28),
+    )
+
+    text = client.get("Scan-Eingang/DEPOT Dateilog 28-08-2026.txt").decode("utf-8")
+    line = [l for l in text.splitlines() if l.strip()][0]
+    assert line.endswith("Dokumente/Energie/Rechnungen/2026-07-15 Stromrechnung.pdf")
+
+
+def test_append_without_path_has_no_trailing_pipe(client):
+    log = DepotLog(client, "Scan-Eingang", "DEPOT Dateilog")
+    log.append("scan1.pdf", "Fehler (1/3 Versuche): boom", tags=["FEHLER"], on_date=date(2026, 8, 28))
+
+    text = client.get("Scan-Eingang/DEPOT Dateilog 28-08-2026.txt").decode("utf-8")
+    line = [l for l in text.splitlines() if l.strip()][0]
+    assert not line.rstrip().endswith("|")

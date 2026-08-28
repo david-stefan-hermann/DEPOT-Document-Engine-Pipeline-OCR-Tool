@@ -148,12 +148,13 @@ class Pipeline:
 
         if self.state.should_quarantine(original_name):
             try:
-                self._quarantine(path)
+                dest_rel = self._quarantine(path)
                 self.state.reset(original_name)
                 self.depot_log.append(
                     original_name,
                     f"Nach {count} Fehlversuchen quarantänisiert: {exc}",
                     tags=[depotlog.TAG_QUARANTINED],
+                    path=dest_rel,
                 )
             except Exception:
                 log.exception("Failed to quarantine %s", original_name)
@@ -164,7 +165,7 @@ class Pipeline:
                 tags=[depotlog.TAG_ERROR],
             )
 
-    def _quarantine(self, path: Path) -> None:
+    def _quarantine(self, path: Path) -> str:
         self.webdav.mkcol(self.config.error_folder)
         existing = {
             e.path.rsplit("/", 1)[-1]
@@ -175,6 +176,7 @@ class Pipeline:
         dest_rel = f"{self.config.error_folder}/{final_name}"
         self.webdav.put(dest_rel, path.read_bytes())
         self._delete_source(path.name)
+        return dest_rel
 
     def _delete_source(self, original_name: str) -> None:
         src_rel = f"{self.config.scan_eingang_webdav_path}/{original_name}"
@@ -206,6 +208,7 @@ class Pipeline:
                 existing_folders=existing_folders,
                 ollama_host=cfg.ollama_host,
                 model=cfg.ollama_model,
+                dokumente_root=cfg.dokumente_webdav_root,
             )
             tags += classifier_tags
             confidence = result.confidence
@@ -242,7 +245,8 @@ class Pipeline:
 
         self.depot_log.append(
             original_name,
-            f"-> {dest_rel} | confidence={confidence:.2f}",
+            f"confidence={confidence:.2f}",
             tags=tags,
+            path=dest_rel,
         )
         log.info("Filed %s -> %s (confidence=%.2f)", original_name, dest_rel, confidence)

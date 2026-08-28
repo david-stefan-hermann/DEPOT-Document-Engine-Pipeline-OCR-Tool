@@ -40,12 +40,18 @@ class DepotLog:
         original_filename: str,
         message: str,
         tags: list[str] | None = None,
+        path: str | None = None,
         on_date: date | None = None,
     ) -> None:
+        """`path`, when given (the Nextcloud destination path of a filed or
+        quarantined document), is always the last thing on the line with
+        nothing after it — so it can be selected/copied by jumping to the
+        end of the line, without trimming trailing decoration first."""
         on_date = on_date or date.today()
         timestamp = datetime.now().strftime("%H:%M:%S")
         tag_str = f" [{', '.join(tags)}]" if tags else ""
-        line = f"{timestamp} | {original_filename} | {message}{tag_str}\n"
+        path_str = f" | {path}" if path else ""
+        line = f"{timestamp} | {original_filename} | {message}{tag_str}{path_str}\n"
 
         rel_path = self._rel_path(on_date)
         existing = self._webdav.get(rel_path) or b""
