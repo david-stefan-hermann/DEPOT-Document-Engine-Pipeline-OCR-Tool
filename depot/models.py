@@ -1,8 +1,17 @@
 from __future__ import annotations
 
-from datetime import date
+import logging
+from datetime import date, timedelta
 
 from pydantic import BaseModel, Field, field_validator
+
+log = logging.getLogger(__name__)
+
+# A real document's issue date is essentially always in the past; allow a small
+# buffer for documents dated slightly ahead (e.g. subscription renewals) and
+# reject anything clearly implausible (OCR/model garbage like year 3107).
+_MIN_PLAUSIBLE_DATE = date(1900, 1, 1)
+_MAX_FUTURE_BUFFER = timedelta(days=60)
 
 
 class ClassificationResult(BaseModel):
@@ -24,6 +33,16 @@ class ClassificationResult(BaseModel):
     @classmethod
     def _strip_title(cls, v: str) -> str:
         return v.strip()
+
+    @field_validator("issue_date")
+    @classmethod
+    def _reject_implausible_date(cls, v: date | None) -> date | None:
+        if v is None:
+            return None
+        if v < _MIN_PLAUSIBLE_DATE or v > date.today() + _MAX_FUTURE_BUFFER:
+            log.warning("Model returned an implausible issue_date %s; discarding it.", v)
+            return None
+        return v
 
 
 class OcrResult(BaseModel):
