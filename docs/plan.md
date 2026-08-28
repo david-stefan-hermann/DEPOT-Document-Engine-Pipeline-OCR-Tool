@@ -151,6 +151,8 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
   infra/
     ollama/
       docker-compose.yml  # Ollama-Stack für Dockge auf dem TrueNAS-Server
+    depot/
+      docker-compose.yml  # DEPOT-Stack für Dockge (Build-Context = GitHub-URL)
   docs/
     plan.md                  # dieses Dokument
     infrastructure-setup.md  # TrueNAS/Ollama/GPU-Setup-Verlauf und Entscheidungen

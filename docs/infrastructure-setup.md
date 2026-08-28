@@ -1,8 +1,8 @@
-# Infrastruktur-Setup: Ollama auf TrueNAS SCALE
+# Infrastruktur-Setup: Ollama, Nextcloud und DEPOT auf TrueNAS SCALE
 
-Dieses Dokument hält den tatsächlichen Setup-Verlauf und die Entscheidungen rund um das
-lokale LLM (Ollama) auf dem TrueNAS-Server fest, damit sie nicht bei jeder Wartung neu
-recherchiert werden müssen.
+Dieses Dokument hält den tatsächlichen Setup-Verlauf und die Entscheidungen rund um die
+Produktiv-Infrastruktur (lokales LLM, Nextcloud-Anbindung, DEPOT-Deployment) auf dem
+TrueNAS-Server fest, damit sie nicht bei jeder Wartung neu recherchiert werden müssen.
 
 ## Server
 
@@ -97,3 +97,31 @@ Ollama-Compose die auskommentierte Sektion zu aktivieren:
 ```
 und den Stack neu zu deployen. Die DEPOT-Pipeline selbst spricht ausschließlich mit der
 Ollama-HTTP-API und muss dafür nicht verändert werden.
+
+## Nextcloud
+
+- Läuft als TrueNAS-Apps-Katalog-App (nicht als eigener Dockge-Stack), Docker-basiert.
+- Wurde am 2026-08-28 von Version 31.0.8 (seit 2026-02-28 EOL, keine Sicherheitsupdates
+  mehr) sequenziell über 32 → 33 auf **34** aktualisiert (Nextcloud erlaubt keine
+  Versions-Sprünge). Vorher wurde ein vollständiges Backup (Daten + Datenbank) erstellt.
+- WebDAV-Basis-URL: `https://nextcloud.avernus.cloud/remote.php/dav/files/vault-boy`
+- Host-Mount des gesamten Webroots: `/mnt/tank/cloud` → `/var/www/html` im Container.
+  Die eigentlichen Nutzerdateien liegen darunter unter Nextclouds Standard-Layout:
+  `/mnt/tank/cloud/data/vault-boy/files/...` — das ist der Pfad, der DEPOT read-only
+  gemountet wird.
+- Der Eingangsordner heißt beim Nutzer exakt **"Scan Eingang"** (mit Leerzeichen, nicht
+  "Scan-Eingang" wie im ursprünglichen Plan als Beispielname verwendet) — wichtig für
+  `SCAN_EINGANG_LOCAL_PATH`/`SCAN_EINGANG_WEBDAV_PATH` in der `.env`.
+
+## DEPOT-Deployment
+
+DEPOT läuft ebenfalls als Dockge-Stack, siehe [`infra/depot/docker-compose.yml`](../infra/depot/docker-compose.yml).
+Bewusste Entscheidung: **kein manuelles `git clone`** auf den Host, sondern die
+GitHub-Repo-URL direkt als Docker-Build-Context (`build.context: https://github.com/...#master`).
+Docker klont dabei bei jedem Build frisch von GitHub — ein "Rebuild" in Dockge (bzw.
+`docker compose up -d --build` per SSH im Stack-Ordner) holt so automatisch den
+aktuellen `master`-Stand, ohne dass der Nutzer manuell `git pull` ausführen muss.
+
+Die `.env` mit den echten Zugangsdaten (Nextcloud-App-Passwort etc.) liegt direkt im
+Dockge-Stack-Verzeichnis dieses Stacks (nicht im Git-Repo, da `.env` per `.gitignore`
+ausgeschlossen ist und Zugangsdaten niemals ins öffentliche Repo gehören).
