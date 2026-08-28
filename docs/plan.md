@@ -70,15 +70,21 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │           --force-ocr, danach ggf. OCR_FAILED → Fallback mit Konfidenz 0.
    │
    ├─► webdav.py: PROPFIND auf Dokumente/ (Depth:1 rekursiv, da Nextcloud kein
-   │           Depth:infinity erlaubt) → aktuelle flache Liste aller Unterordner
+   │           Depth:infinity erlaubt) → flache Liste aller Unterordner, 5 Min. gecacht
+   │           (self-erstellte Ordner sofort im Cache ergänzt), gefiltert um
+   │           `excluded_folders` aus DEPOT Config.json
    │
-   ├─► classifier.py: Prompt aus OCR-Text (gekürzt, Datum/Titel stehen fast immer auf
-   │           Seite 1), ursprünglichem Dateinamen und aktueller Ordnerliste →
-   │           Ollama-Chat-Aufruf mit striktem JSON-Schema → pydantic-validiertes
-   │           Ergebnis {folder, is_new_folder, title, issue_date, confidence, reasoning}.
-   │           Konfidenz wird zusätzlich serverseitig heruntergestuft bei
-   │           halluzinierten Ordnerpfaden oder Ordnernamen, die bestehenden stark
-   │           ähneln (Fuzzy-Match), um Beinahe-Duplikate zu vermeiden.
+   ├─► classifier.py — zwei getrennte Schritte statt einem Aufruf mit der ganzen
+   │   Ordnerliste auf einmal (Grund: bei einer sehr großen/tiefen Struktur verliert
+   │   ein kleines Modell sonst den Faden und wählt Unsinn — real aufgetreten):
+   │     1. extract_content(): ein Ollama-Aufruf, NUR OCR-Text + Dateiname, ohne
+   │        Ordnerkontext → {title, issue_date, confidence}.
+   │     2. _walk_folder_tree(): steigt Ebene für Ebene durch Dokumente/ ab. Pro
+   │        Ebene ein Ollama-Aufruf mit nur den direkten Unterordnern DIESER Ebene
+   │        (plus vollem Dokumenttext erneut) → "descend"/"stay"/"new_folder".
+   │        Ungültige/halluzinierte Wahlen werden gegen die (kleine) Kandidatenliste
+   │        dieser Ebene per Fuzzy-Match korrigiert oder sicher als "stay" behandelt.
+   │        Gesamt-Konfidenz = niedrigste Einzelkonfidenz über Inhalt + alle Schritte.
    │
    ├─► naming.py: Titel sanitizen, Datum validieren, Dateiname
    │           "YYYY-MM-DD Titel.ext" bauen, Kollisionen auflösen ("(2)", "(3)", …)
@@ -140,11 +146,12 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
     pipeline.py      # Verarbeitung pro Datei
     ocr.py           # img2pdf/ocrmypdf-Wrapper, Qualitätscheck
     webdav.py        # PROPFIND / MKCOL / PUT / GET / DELETE / MOVE, httpx-basiert
-    classifier.py    # Prompt-Bau, Ollama-Aufruf, Konfidenz-Logik
+    classifier.py    # Content-Extraktion + hierarchischer Ordner-Abstieg, Ollama-Aufrufe
     naming.py        # Sanitizing, Datumsparsing, Kollisionen, Fuzzy-Ordner-Match
     depotlog.py      # Dateilog-TXT-Writer/Rotation
+    scan_config.py   # DEPOT Config.json (excluded_folders) lesen/anwenden
     state.py         # sqlite Fehlversuch-Tracker
-    models.py        # pydantic-Schema
+    models.py        # pydantic-Schemas (ContentExtraction, FolderStepDecision)
   tests/
     conftest.py       # Fake-Nextcloud-WebDAV-Server für Tests
     test_*.py
@@ -173,8 +180,13 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
   transienter Fallback (zählt nicht zum permanenten Fehlerlimit, wird stattdessen
   automatisch requeued).
 - **WebDAV-Auth-Fehler:** Connectivity-Check beim Start, klarer Fehlschlag mit Log.
-- **Ordner-Kollisionen/Fast-Duplikate:** Fuzzy-Match neuer Ordnervorschläge gegen
-  bestehende Blätter, Konfidenz herabsetzen statt stillschweigend anzulegen.
+- **Ordner-Kollisionen/Fast-Duplikate:** Fuzzy-Match auf jeder Abstiegs-Ebene gegen die
+  echten Kinder dieser Ebene — bei hoher Ähnlichkeit wird automatisch dorthin umgeleitet
+  (`AUTO-REDIRECTED`/`AUTO-KORRIGIERT` im Log) statt einen Beinahe-Duplikat-Ordner
+  anzulegen oder in `Unsortiert` zu landen.
+- **Strukturell irrelevante Teilbäume** (z.B. ein riesiger Games/Amiibo-Ordner): über
+  `excluded_folders` in der nutzereditierbaren `DEPOT Config.json` (in Scan-Eingang)
+  komplett von der Kandidatenliste ausschließen.
 - **Nicht-ASCII-Dateinamen:** NFC-Normalisierung vor jedem Vergleich/WebDAV-Pfad.
 - **Große Batches:** eine `queue.Queue` + feste Worker-Zahl (Default 1), um CPU
   (Tesseract) und LLM (Ollama) auf bescheidener Hardware nicht zu überlasten.
