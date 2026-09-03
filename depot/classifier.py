@@ -32,15 +32,22 @@ class ClassificationOutcome(NamedTuple):
     title: str
     confidence: float
     issue_date: date | None = None
+    correspondent: str | None = None
 
 
 _CONTENT_SYSTEM_PROMPT = """\
 Du extrahierst Kerninformationen aus einem gescannten Dokument.
 
 Regeln:
-- "title" ist ein kurzer, praegnanter Titel ohne Datum, ohne Dateiendung und \
-ohne Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli" oder \
-"Bussgeldbescheid". Referenznummern gehoeren NIEMALS in den Titel.
+- "correspondent" ist der Absender/Aussteller des Dokuments (Firma, Behoerde, \
+Institution) - kurz und wiedererkennbar, z.B. "Stadtwerke Muenchen" statt \
+"Stadtwerke Muenchen Servicegesellschaft mbH", oder null falls kein klarer \
+Absender erkennbar ist (z.B. private Notizen). Der Absender darf NICHT \
+nochmal im "title" wiederholt werden.
+- "title" ist ein kurzer, praegnanter Betreff OHNE den Absendernamen (der \
+steht bereits in "correspondent"), ohne Datum, ohne Dateiendung und ohne \
+Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli" oder "Bussgeldbescheid". \
+Referenznummern gehoeren NIEMALS in den Titel.
 - "issue_date" ist das Ausstellungs-/Rechnungsdatum des Dokuments im Format \
 YYYY-MM-DD, oder null falls nicht ermittelbar. Deutsche Datumsangaben im Text \
 sind TT.MM.JJJJ (Tag zuerst) - wandle sie sorgfaeltig um, ohne Ziffern zu \
@@ -264,6 +271,7 @@ def classify(
         is_new_folder=is_new_folder,
         title=content.title,
         issue_date=content.issue_date,
+        correspondent=content.correspondent,
         confidence=overall_confidence,
     )
     return outcome, tags

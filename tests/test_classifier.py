@@ -182,12 +182,18 @@ class _FakeClient:
 
 
 def test_extract_content_parses_valid_response(monkeypatch):
-    canned = {"title": "Stromrechnung Juli", "issue_date": "2026-07-15", "confidence": 0.9}
+    canned = {
+        "title": "Stromrechnung Juli",
+        "correspondent": "Stadtwerke München",
+        "issue_date": "2026-07-15",
+        "confidence": 0.9,
+    }
     monkeypatch.setattr(ollama, "Client", lambda *a, **k: _FakeClient(canned))
 
     result = classifier.extract_content("ocr text", "scan.pdf", "http://fake", "model")
     assert isinstance(result, ContentExtraction)
     assert result.title == "Stromrechnung Juli"
+    assert result.correspondent == "Stadtwerke München"
     assert result.issue_date == date(2026, 7, 15)
 
 
@@ -219,7 +225,9 @@ def test_decide_folder_step_parses_valid_response(monkeypatch):
 def test_classify_combines_content_and_folder_walk(monkeypatch):
     monkeypatch.setattr(
         classifier, "extract_content",
-        lambda *a, **k: ContentExtraction(title="Arztrechnung", issue_date=date(2026, 6, 10), confidence=0.8),
+        lambda *a, **k: ContentExtraction(
+            title="Arztrechnung", correspondent="Dr. Müller", issue_date=date(2026, 6, 10), confidence=0.8
+        ),
     )
     monkeypatch.setattr(
         classifier, "_walk_folder_tree",
@@ -235,6 +243,7 @@ def test_classify_combines_content_and_folder_walk(monkeypatch):
     )
     assert outcome.folder == "Dokumente/Gesundheit/Krankenkasse"
     assert outcome.title == "Arztrechnung"
+    assert outcome.correspondent == "Dr. Müller"
     assert outcome.issue_date == date(2026, 6, 10)
     assert outcome.confidence == 0.8  # min(content=0.8, folder=0.95)
     assert tags == []

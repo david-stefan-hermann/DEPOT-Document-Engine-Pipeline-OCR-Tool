@@ -53,7 +53,7 @@ class Pipeline:
             config.nextcloud_app_password,
         )
         self.depot_log = depot_log or DepotLog(
-            self.webdav, config.scan_eingang_webdav_path, config.log_file_prefix
+            self.webdav, config.scan_eingang_webdav_path, config.log_file_prefix, config.config_subfolder
         )
         self.state = state or StateStore(config.state_db_path)
         self._transient_retries: dict[str, int] = {}
@@ -69,7 +69,9 @@ class Pipeline:
             if stale:
                 folders = self.webdav.list_folders_recursive(self.config.dokumente_webdav_root)
                 excluded = scan_config.load_excluded_folders(
-                    self.config.scan_eingang_local_path, self.config.config_file_name
+                    self.config.scan_eingang_local_path,
+                    self.config.config_subfolder,
+                    self.config.config_file_name,
                 )
                 self._folder_cache = scan_config.filter_excluded(folders, excluded)
                 self._folder_cache_time = now
@@ -197,6 +199,7 @@ class Pipeline:
         if ocr_result.ocr_failed:
             target_folder = cfg.fallback_folder
             title = path.stem
+            correspondent = None
             issue_date = None
             confidence = 0.0
             tags += [depotlog.TAG_OCR_FAILED, depotlog.TAG_UNSORTED]
@@ -213,6 +216,7 @@ class Pipeline:
             tags += classifier_tags
             confidence = result.confidence
             title = result.title
+            correspondent = result.correspondent
             issue_date = result.issue_date
 
             if confidence < cfg.confidence_threshold:
@@ -228,7 +232,7 @@ class Pipeline:
 
         self.webdav.mkcol(target_folder)
         self._remember_folder(target_folder)
-        desired_name = naming.build_filename(title, issue_date, today, ext=ext)
+        desired_name = naming.build_filename(title, issue_date, today, ext=ext, correspondent=correspondent)
         existing_names = {
             e.path.rsplit("/", 1)[-1]
             for e in self.webdav.list_dir(target_folder)

@@ -10,33 +10,41 @@ def test_is_config_file_exact_match_only():
 
 
 def test_load_excluded_folders_missing_file_returns_empty(tmp_path):
-    assert scan_config.load_excluded_folders(str(tmp_path), "DEPOT Config.json") == []
+    assert scan_config.load_excluded_folders(str(tmp_path), "Config", "DEPOT Config.json") == []
 
 
 def test_load_excluded_folders_reads_list(tmp_path):
-    (tmp_path / "DEPOT Config.json").write_text(
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(
         json.dumps({"excluded_folders": ["Dokumente/Games", "Dokumente/Media/"]}),
         encoding="utf-8",
     )
-    result = scan_config.load_excluded_folders(str(tmp_path), "DEPOT Config.json")
+    result = scan_config.load_excluded_folders(str(tmp_path), "Config", "DEPOT Config.json")
     assert result == ["Dokumente/Games", "Dokumente/Media"]
 
 
 def test_load_excluded_folders_malformed_json_returns_empty(tmp_path):
-    (tmp_path / "DEPOT Config.json").write_text("{not valid json", encoding="utf-8")
-    assert scan_config.load_excluded_folders(str(tmp_path), "DEPOT Config.json") == []
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text("{not valid json", encoding="utf-8")
+    assert scan_config.load_excluded_folders(str(tmp_path), "Config", "DEPOT Config.json") == []
 
 
 def test_load_excluded_folders_wrong_type_returns_empty(tmp_path):
-    (tmp_path / "DEPOT Config.json").write_text(
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(
         json.dumps({"excluded_folders": "Dokumente/Games"}), encoding="utf-8"
     )
-    assert scan_config.load_excluded_folders(str(tmp_path), "DEPOT Config.json") == []
+    assert scan_config.load_excluded_folders(str(tmp_path), "Config", "DEPOT Config.json") == []
 
 
 def test_load_excluded_folders_missing_key_returns_empty(tmp_path):
-    (tmp_path / "DEPOT Config.json").write_text(json.dumps({}), encoding="utf-8")
-    assert scan_config.load_excluded_folders(str(tmp_path), "DEPOT Config.json") == []
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(json.dumps({}), encoding="utf-8")
+    assert scan_config.load_excluded_folders(str(tmp_path), "Config", "DEPOT Config.json") == []
 
 
 def test_filter_excluded_removes_exact_and_nested():

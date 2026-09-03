@@ -31,6 +31,7 @@ def make_config(tmp_path, **overrides) -> Config:
         confidence_threshold=0.6,
         log_file_prefix="DEPOT Dateilog",
         config_file_name="DEPOT Config.json",
+        config_subfolder="Config",
         ocr_language="deu",
         max_concurrent_jobs=1,
         state_db_path=str(tmp_path / "state.sqlite3"),
@@ -43,7 +44,9 @@ def make_config(tmp_path, **overrides) -> Config:
 @pytest.fixture
 def pipeline(tmp_path, fake_server, client):
     config = make_config(tmp_path)
-    depot_log = DepotLog(client, config.scan_eingang_webdav_path, config.log_file_prefix)
+    depot_log = DepotLog(
+        client, config.scan_eingang_webdav_path, config.log_file_prefix, config.config_subfolder
+    )
     state = StateStore(config.state_db_path)
     p = Pipeline(config, webdav=client, depot_log=depot_log, state=state)
     yield p
@@ -60,6 +63,16 @@ def _make_ocr_pdf(tmp_path, name="ocr-out.pdf", content=b"%PDF-with-text-layer")
     path = tmp_path / name
     path.write_bytes(content)
     return path
+
+
+def _get_log_text(fake_server, client) -> str:
+    """The pipeline now writes one log file per processed event (timestamped
+    to the second) into Scan-Eingang/Config/, instead of one shared daily
+    file - fetch whichever single log file a test's single process_one()
+    call produced."""
+    log_paths = [p for p in fake_server.files if p.startswith("Scan-Eingang/Config/DEPOT Dateilog ")]
+    assert len(log_paths) == 1, f"expected exactly one log file, found {log_paths}"
+    return client.get(log_paths[0]).decode("utf-8")
 
 
 def _seed_source_on_server(pipeline, client, scan_path: Path):
@@ -101,9 +114,7 @@ def test_happy_path_files_into_existing_folder(monkeypatch, tmp_path, pipeline, 
     files = {p for p in fake_server.files if p.startswith("Dokumente/Gesundheit/Krankenkasse/")}
     assert len(files) == 1
     assert client.get(f"Scan-Eingang/{scan.name}") is None  # source removed
-    log_text = client.get("Scan-Eingang/DEPOT Dateilog " + time.strftime("%d-%m-%Y") + ".txt")
-    assert log_text is not None
-    assert "scan1.pdf" in log_text.decode("utf-8")
+    assert "scan1.pdf" in _get_log_text(fake_server, client)
 
 
 def test_low_confidence_goes_to_fallback(monkeypatch, tmp_path, pipeline, fake_server, client):
@@ -171,8 +182,7 @@ def test_new_folder_is_created_and_tagged(monkeypatch, tmp_path, pipeline, fake_
     pipeline.process_one(scan)
 
     assert "Dokumente/Motorrad/Ersatzteile" in fake_server.collections
-    log_text = client.get("Scan-Eingang/DEPOT Dateilog " + time.strftime("%d-%m-%Y") + ".txt").decode("utf-8")
-    assert "NEUER-ORDNER" in log_text
+    assert "NEUER-ORDNER" in _get_log_text(fake_server, client)
 
 
 def test_filename_collision_gets_suffix(monkeypatch, tmp_path, pipeline, fake_server, client):
@@ -335,7 +345,9 @@ def test_excluded_folders_from_config_file_are_never_offered(tmp_path, pipeline,
 
     client.mkcol("Dokumente/Games/Amiibo-main")
     client.mkcol("Dokumente/Gesundheit")
-    (tmp_path / "DEPOT Config.json").write_text(
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(
         json.dumps({"excluded_folders": ["Dokumente/Games"]}), encoding="utf-8"
     )
 

@@ -27,9 +27,10 @@ def _normalize_confidence_value(v: float | int) -> float:
 
 class ContentExtraction(BaseModel):
     """What the document IS, independent of where it should be filed:
-    title and issue date, extracted from OCR text alone."""
+    title, issue date and correspondent, extracted from OCR text alone."""
 
     title: str = Field(min_length=1)
+    correspondent: str | None = None
     issue_date: date | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ""
@@ -43,6 +44,14 @@ class ContentExtraction(BaseModel):
     @classmethod
     def _strip_title(cls, v: str) -> str:
         return v.strip()
+
+    @field_validator("correspondent")
+    @classmethod
+    def _strip_correspondent(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        return v or None
 
     @field_validator("issue_date")
     @classmethod

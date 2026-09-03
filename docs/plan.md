@@ -40,10 +40,11 @@ Fehlzuordnungen manuell in Nextcloud zu korrigieren.
 - **Trigger:** vollautomatisch per Datei-Watcher auf `Scan-Eingang`.
 - **Umgebung:** Docker-Container auf dem TrueNAS-Server selbst, neben Nextcloud.
 - **Ordnerstruktur-Abfrage:** live per WebDAV bei jedem Lauf (kein Cache).
-- **Kein Review-Bereich:** direkte Einsortierung + Logdatei `DEPOT Dateilog
-  DD-MM-YYYY.txt` in `Scan-Eingang`, die täglich neu benannt und bei jeder Einsortierung
-  ergänzt wird. Der Watcher/Scanner ignoriert jede Datei, deren Name "DEPOT Dateilog"
-  enthält.
+- **Kein Review-Bereich:** direkte Einsortierung + Logdatei pro verarbeiteter Datei
+  `DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt` in `Scan-Eingang/Config/` (siehe
+  `CONFIG_SUBFOLDER`). Der Watcher ist nicht-rekursiv, sieht diesen Unterordner also
+  ohnehin nie als Scan-Eingang; die Namens-basierte Ignorier-Logik bleibt zusätzlich als
+  Sicherheitsnetz für Alt-Dateien aus der Zeit vor diesem Unterordner bestehen.
 - **Dateiname als Signal:** ein vom Nutzer bereits vergebener Dateiname fließt zusätzlich
   zum OCR-Text in die Klassifikationsentscheidung ein.
 - **Unsichere Fälle:** landen in einem Fallback-Ordner `Dokumente/Unsortiert`, deutlich im
@@ -61,6 +62,8 @@ watcher.py (watchdog Observer, on_created/on_moved + Startup-Sweep bei Container
    │  - ignoriert Dateinamen, die "DEPOT Dateilog" enthalten
    │  - ignoriert nicht-whitelisted Dateiendungen (.pdf .jpg .jpeg .png .tif .tiff)
    │  - Debounce: wartet bis Dateigröße ~2s stabil ist (Scanner schreiben inkrementell)
+   │  - nicht-rekursiv: `Scan-Eingang/Config/` (Logs + `DEPOT Config.json`) wird dadurch
+   │    strukturell nie als Scan-Eingabe betrachtet, ganz ohne Namensfilter
    ▼
 pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │
@@ -96,7 +99,8 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │           erzeugen sonst unsichtbare "Ghost-Dateien" bis ein manueller
    │           `occ files:scan` läuft)
    │
-   └─► depotlog.py: Eintrag in Scan-Eingang/DEPOT Dateilog DD-MM-YYYY.txt anhängen,
+   └─► depotlog.py: eigene Logdatei pro Verarbeitungs-Event unter
+               Scan-Eingang/Config/DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt schreiben,
                inkl. Sondermarkierung für [OCR-FEHLGESCHLAGEN], [UNSORTIERT] und
                [NEUER-ORDNER]-Fälle
 ```
@@ -127,9 +131,30 @@ für den aktuellen Stand zu GPU-Beschleunigung.
 
 ## Dateiname-Konvention
 
-`YYYY-MM-DD Titel.ext`, z.B. `2026-07-15 Stromrechnung Juli.pdf`. Fehlt ein erkennbares
-Datum, wird das Verarbeitungsdatum verwendet, der Titel erhält den Zusatz
-"(Datum unsicher)" und der Logeintrag wird mit `[DATE-UNCERTAIN]` markiert.
+`YYYY-MM-DD [Absender - ]Titel.ext`, z.B. `2026-07-15 Stadtwerke München -
+Stromrechnung Juli.pdf`, ohne erkennbaren Absender weiterhin schlicht
+`2026-07-15 Stromrechnung Juli.pdf`. Fehlt ein erkennbares Datum, wird das
+Verarbeitungsdatum verwendet, der Titel erhält den Zusatz "(Datum unsicher)" und der
+Logeintrag wird mit `[DATUM-UNSICHER]` markiert.
+
+**Absender als eigenes Feld (statt Teil des freien Titels):** Recherche zu bestehenden
+Lösungen (v.a. paperless-ngx, das Korrespondent/Dokumenttyp/Titel als getrennte Felder
+modelliert und per Template zusammensetzt, sowie allgemeine Records-Management-Konventionen
+für gescannte Geschäftspost: `Datum_Absender_Dokumenttyp[_Referenz]`) zeigt durchgehend,
+dass ein Datum-zuerst-Präfix (bereits vorhanden) plus ein separates, kurzes
+Korrespondenz-Feld die Konsistenz deutlich verbessert, gerade weil kleine LLMs bei einem
+einzigen freien "Titel"-Feld stark variierende Formulierungen für inhaltlich gleiche
+Dokumente liefern (Absender fließt sonst unstrukturiert und uneinheitlich mit ein). Ein
+drittes, striktes `document_type`-Enum-Feld (wie bei paperless-ngx) wurde bewusst NICHT
+übernommen: DEPOT hat keine Metadaten-Datenbank/Such-UI, die davon profitieren würde – die
+vorhandene, handgepflegte Ordnerstruktur übernimmt diese Kategorisierung bereits
+strukturell. Umsetzung:
+- `classifier.py`/`models.py`: `ContentExtraction.correspondent` (optional, `None` wenn
+  kein klarer Absender erkennbar), per Prompt-Regel explizit NICHT mehr redundant im
+  `title` enthalten.
+- `naming.py`: `build_filename(..., correspondent=...)` stellt `"{Absender} - "` voran,
+  wenn vorhanden; `MAX_FILENAME_LENGTH` (150 Zeichen) kappt das Ergebnis hart, als
+  Sicherheitsnetz gegen ausufernde OCR-Titel bei tief verschachtelten Nextcloud-Pfaden.
 
 ## Repo-Struktur
 
@@ -148,7 +173,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
     webdav.py        # PROPFIND / MKCOL / PUT / GET / DELETE / MOVE, httpx-basiert
     classifier.py    # Content-Extraktion + hierarchischer Ordner-Abstieg, Ollama-Aufrufe
     naming.py        # Sanitizing, Datumsparsing, Kollisionen, Fuzzy-Ordner-Match
-    depotlog.py      # Dateilog-TXT-Writer/Rotation
+    depotlog.py      # Dateilog-TXT-Writer, ein File pro Verarbeitungs-Event
     scan_config.py   # DEPOT Config.json (excluded_folders) lesen/anwenden
     state.py         # sqlite Fehlversuch-Tracker
     models.py        # pydantic-Schemas (ContentExtraction, FolderStepDecision)
@@ -209,7 +234,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (57 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (100 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

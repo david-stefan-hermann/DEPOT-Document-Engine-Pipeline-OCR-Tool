@@ -34,6 +34,7 @@ class Config:
 
     log_file_prefix: str
     config_file_name: str
+    config_subfolder: str
     ocr_language: str
     max_concurrent_jobs: int
     state_db_path: str
@@ -64,6 +65,7 @@ class Config:
             confidence_threshold=float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6")),
             log_file_prefix=os.environ.get("LOG_FILE_PREFIX", "DEPOT Dateilog"),
             config_file_name=os.environ.get("CONFIG_FILE_NAME", "DEPOT Config.json"),
+            config_subfolder=os.environ.get("CONFIG_SUBFOLDER", "Config").strip("/"),
             ocr_language=os.environ.get("OCR_LANGUAGE", "deu"),
             max_concurrent_jobs=int(os.environ.get("MAX_CONCURRENT_JOBS", "1")),
             state_db_path=os.environ.get(

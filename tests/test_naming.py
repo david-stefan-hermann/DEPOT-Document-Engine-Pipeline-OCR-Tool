@@ -30,6 +30,45 @@ def test_build_filename_respects_custom_extension():
     assert name.endswith(".jpg")
 
 
+def test_build_filename_with_correspondent():
+    name = naming.build_filename(
+        "Stromrechnung Juli", date(2026, 7, 15), date(2026, 8, 28), correspondent="Stadtwerke München"
+    )
+    assert name == "2026-07-15 Stadtwerke München - Stromrechnung Juli.pdf"
+
+
+def test_build_filename_without_correspondent_unchanged():
+    name = naming.build_filename("Stromrechnung Juli", date(2026, 7, 15), date(2026, 8, 28), correspondent=None)
+    assert name == "2026-07-15 Stromrechnung Juli.pdf"
+
+
+def test_build_filename_blank_correspondent_is_omitted():
+    name = naming.build_filename("Stromrechnung Juli", date(2026, 7, 15), date(2026, 8, 28), correspondent="   ")
+    assert name == "2026-07-15 Stromrechnung Juli.pdf"
+
+
+def test_build_filename_correspondent_and_uncertain_date():
+    name = naming.build_filename("Kontoauszug", None, date(2026, 8, 28), correspondent="Sparkasse")
+    assert name == "2026-08-28 Sparkasse - Kontoauszug (Datum unsicher).pdf"
+
+
+def test_build_filename_truncates_overly_long_result():
+    long_title = "Sehr " * 60 + "langer Titel"
+    name = naming.build_filename(long_title, date(2026, 7, 15), date(2026, 8, 28), correspondent="Ein Absender")
+    assert len(name) <= naming.MAX_FILENAME_LENGTH
+    assert name.startswith("2026-07-15 Ein Absender - Sehr ")
+
+
+def test_sanitize_correspondent_strips_invalid_chars():
+    assert naming.sanitize_correspondent('Stadtwerke: München?') == "Stadtwerke München"
+
+
+def test_sanitize_correspondent_blank_returns_empty_string():
+    assert naming.sanitize_correspondent("") == ""
+    assert naming.sanitize_correspondent(None) == ""
+    assert naming.sanitize_correspondent("///???") == ""
+
+
 def test_resolve_collision_no_conflict():
     assert naming.resolve_collision("2026-07-15 Miete.pdf", set()) == "2026-07-15 Miete.pdf"
 

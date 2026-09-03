@@ -152,6 +152,16 @@ Im Ollama-Compose ist die GPU-Sektion jetzt aktiv:
 Die DEPOT-Pipeline selbst spricht ausschließlich mit der Ollama-HTTP-API und musste dafür
 nicht verändert werden.
 
+## GPU-Nutzung erneut verifiziert (2026-09-03)
+
+Per `curl` gegen die Ollama-API (`/api/generate`, danach `/api/ps`) direkt gegenprüft, ob
+die GTX 1060 tatsächlich noch für Inferenz genutzt wird (nicht nur `nvidia-smi` auf
+Treiberebene): `size_vram` in der `/api/ps`-Antwort entsprach exakt der vollen Modellgröße
+(4.75 GB) — das komplette Modell liegt im VRAM, kein CPU-Offload. Prompt-Verarbeitung lag
+bei ~253 Tokens/Sekunde, deutlich über den zuvor dokumentierten ~8–15 Tokens/Sekunde
+CPU-only-Werten. **Status: GPU-Beschleunigung ist aktiv und wird von Ollama tatsächlich
+genutzt**, keine weiteren Schritte nötig.
+
 ## Modell-Experimente
 
 - **Qwen2.5 7B Instruct (q4_K_M)** — Standardmodell, funktioniert mit dem hierarchischen

@@ -10,6 +10,11 @@ from pathvalidate import sanitize_filename
 # titles (quotes/asterisks etc. sneak in from OCR'd document text).
 _INVALID_CHARS = '/\\:*?"<>|'
 
+# Conservative cap on the generated filename's length (date prefix + name +
+# extension), leaving headroom for Nextcloud's own path-length limit given
+# that files also sit several folder levels deep under Dokumente/.
+MAX_FILENAME_LENGTH = 150
+
 
 def normalize(text: str) -> str:
     """NFC-normalize text before any comparison or WebDAV path use, so
@@ -26,18 +31,47 @@ def sanitize_title(title: str) -> str:
     return sanitized.strip() or "Dokument"
 
 
-def build_filename(title: str, issue_date: date | None, processed_on: date, ext: str = "pdf") -> str:
-    """Build the canonical `YYYY-MM-DD Titel.pdf` filename. Falls back to the
-    processing date (with a visible marker) when no issue date could be
-    determined, so the sortable date-prefix convention never breaks. `ext`
-    defaults to pdf (OCR always produces a searchable PDF) but callers may
-    pass the original extension for the rare case where OCR produced nothing
-    usable at all and the raw scan bytes are being filed as-is."""
+def sanitize_correspondent(correspondent: str | None) -> str:
+    """Like sanitize_title, but returns "" (not the "Dokument" fallback) for
+    blank/unusable input, since the correspondent is an optional field that
+    is simply omitted from the filename when unknown."""
+    if not correspondent:
+        return ""
+    cleaned = sanitize_title(correspondent)
+    return "" if cleaned == "Dokument" else cleaned
+
+
+def build_filename(
+    title: str,
+    issue_date: date | None,
+    processed_on: date,
+    ext: str = "pdf",
+    correspondent: str | None = None,
+) -> str:
+    """Build the canonical `YYYY-MM-DD [Absender - ]Titel.pdf` filename.
+    Falls back to the processing date (with a visible marker) when no issue
+    date could be determined, so the sortable date-prefix convention never
+    breaks. `correspondent` (who issued/sent the document) is optional and,
+    when present, is prefixed to the title with " - " so documents from the
+    same sender sort/scan together at a glance without cluttering the free
+    text title itself. `ext` defaults to pdf (OCR always produces a
+    searchable PDF) but callers may pass the original extension for the rare
+    case where OCR produced nothing usable at all and the raw scan bytes are
+    being filed as-is."""
     clean_title = sanitize_title(title)
+    clean_correspondent = sanitize_correspondent(correspondent)
     ext = ext.lstrip(".")
-    if issue_date is not None:
-        return f"{issue_date.isoformat()} {clean_title}.{ext}"
-    return f"{processed_on.isoformat()} {clean_title} (Datum unsicher).{ext}"
+    date_str = issue_date.isoformat() if issue_date is not None else processed_on.isoformat()
+
+    name_core = f"{clean_correspondent} - {clean_title}" if clean_correspondent else clean_title
+    if issue_date is None:
+        name_core = f"{name_core} (Datum unsicher)"
+
+    budget = MAX_FILENAME_LENGTH - len(date_str) - len(ext) - 2  # spaces + dot
+    if budget > 0 and len(name_core) > budget:
+        name_core = name_core[:budget].rstrip()
+
+    return f"{date_str} {name_core}.{ext}"
 
 
 def resolve_collision(desired_name: str, existing_names: set[str]) -> str:

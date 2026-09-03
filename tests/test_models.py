@@ -65,6 +65,23 @@ def test_content_empty_title_rejected():
         ContentExtraction.model_validate({"title": "", "confidence": 0.5})
 
 
+def test_content_correspondent_is_stripped():
+    result = ContentExtraction.model_validate(
+        {"title": "Stromrechnung Juli", "correspondent": "  Stadtwerke München  ", "confidence": 0.9}
+    )
+    assert result.correspondent == "Stadtwerke München"
+
+
+def test_content_correspondent_defaults_to_none():
+    result = ContentExtraction.model_validate({"title": "Notiz", "confidence": 0.5})
+    assert result.correspondent is None
+
+
+def test_content_blank_correspondent_becomes_none():
+    result = ContentExtraction.model_validate({"title": "Notiz", "correspondent": "   ", "confidence": 0.5})
+    assert result.correspondent is None
+
+
 # ---- FolderStepDecision ----------------------------------------------------
 
 def test_folder_step_decision_parses_descend():

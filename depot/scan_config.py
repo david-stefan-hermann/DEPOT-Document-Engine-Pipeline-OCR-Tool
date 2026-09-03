@@ -11,12 +11,14 @@ def is_config_file(filename: str, config_file_name: str) -> bool:
     return filename == config_file_name
 
 
-def load_excluded_folders(scan_eingang_local_path: str, config_file_name: str) -> list[str]:
+def load_excluded_folders(
+    scan_eingang_local_path: str, config_subfolder: str, config_file_name: str
+) -> list[str]:
     """Reads `excluded_folders` from the user-editable DEPOT Config.json in
-    Scan-Eingang, if present. Missing file or malformed content just means
-    "no exclusions" rather than a hard failure — this is a convenience knob,
-    not critical configuration."""
-    config_path = Path(scan_eingang_local_path) / config_file_name
+    Scan-Eingang/<config_subfolder>, if present. Missing file or malformed
+    content just means "no exclusions" rather than a hard failure — this is
+    a convenience knob, not critical configuration."""
+    config_path = Path(scan_eingang_local_path) / config_subfolder / config_file_name
     if not config_path.is_file():
         return []
     try:
