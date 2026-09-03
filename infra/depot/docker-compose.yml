@@ -1,7 +1,6 @@
 services:
   depot:
-    build:
-      context: https://github.com/david-stefan-hermann/DEPOT-Document-Engine-Pipeline-OCR-Tool.git#master
+    image: ghcr.io/david-stefan-hermann/depot:latest
     restart: unless-stopped
     volumes:
       - /mnt/tank/applications/nextcloud-user-data/vault-boy/files:/nextcloud-data:ro

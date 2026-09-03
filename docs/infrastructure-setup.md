@@ -205,12 +205,40 @@ genutzt**, keine weiteren Schritte nötig.
 ## DEPOT-Deployment
 
 DEPOT läuft ebenfalls als Dockge-Stack, siehe [`infra/depot/docker-compose.yml`](../infra/depot/docker-compose.yml).
-Bewusste Entscheidung: **kein manuelles `git clone`** auf den Host, sondern die
-GitHub-Repo-URL direkt als Docker-Build-Context (`build.context: https://github.com/...#master`).
-Docker klont dabei bei jedem Build frisch von GitHub — ein "Rebuild" in Dockge (bzw.
-`docker compose up -d --build` per SSH im Stack-Ordner) holt so automatisch den
-aktuellen `master`-Stand, ohne dass der Nutzer manuell `git pull` ausführen muss.
 
 Die `.env` mit den echten Zugangsdaten (Nextcloud-App-Passwort etc.) liegt direkt im
 Dockge-Stack-Verzeichnis dieses Stacks (nicht im Git-Repo, da `.env` per `.gitignore`
 ausgeschlossen ist und Zugangsdaten niemals ins öffentliche Repo gehören).
+
+### Image-Build via GitHub Actions statt Git-Build-Context (seit 2026-09-03)
+
+**Ursprünglicher Ansatz (verworfen):** GitHub-Repo-URL direkt als Docker-Build-Context
+(`build.context: https://github.com/...#master`), damit ein "Rebuild" in Dockge automatisch
+den aktuellen `master`-Stand holt, ohne manuelles `git pull` auf dem Server.
+
+**Praxisproblem:** Dockges "Update"-Button führt intern (siehe `backend/stack.ts` im
+Dockge-Quellcode) exakt `docker compose pull` gefolgt von `docker compose up -d
+--remove-orphans` aus. `docker compose pull` hat aber bei einem Service mit `build:` (statt
+`image:`) nichts zu tun — es gibt kein Registry-Image zum Ziehen. Ergebnis: der Button lief
+zwar fehlerfrei durch, holte aber nie neuen Code; nötig war stattdessen manuell per SSH
+`docker compose build --no-cache && docker compose up -d` im Stack-Ordner (das docker-intern
+gecachte Git-Checkout musste zusätzlich mit `--no-cache` umgangen werden, sonst blieb sogar
+das ein stiller No-Op).
+
+**Lösung:** [`.github/workflows/docker-publish.yml`](../.github/workflows/docker-publish.yml)
+baut bei jedem Push auf `master`, der `Dockerfile`, `requirements.txt`, `run.py` oder
+`depot/**` verändert, automatisch das Image und pusht es nach GitHub Container Registry
+als `ghcr.io/david-stefan-hermann/depot:latest` (zusätzlich mit dem Commit-SHA getaggt).
+`infra/depot/docker-compose.yml` referenziert jetzt dieses Image statt eines Build-Contexts.
+Damit macht der Dockge-Update-Button genau das, wofür er gebaut ist: `pull` holt das frisch
+gebaute Image, `up -d` recreated den Container damit.
+
+**Einmaliger manueller Schritt:** Nach dem ersten erfolgreichen Actions-Lauf muss das
+GHCR-Package unter github.com/david-stefan-hermann → Packages → `depot` → Package settings
+auf **Public** gestellt werden, sonst kann der TrueNAS-Docker-Daemon es ohne
+Registry-Login nicht ziehen (das Repo selbst ist zwar öffentlich, ein frisch erstelltes
+GHCR-Package ist es standardmäßig aber nicht).
+
+**Ablauf für ein Update ab jetzt:** Code committen und nach `master` pushen → GitHub Actions
+baut automatisch (~1-3 Min, Fortschritt unter dem "Actions"-Tab des Repos einsehbar) → in
+Dockge auf den `depot`-Stack den **Update**-Button klicken.
