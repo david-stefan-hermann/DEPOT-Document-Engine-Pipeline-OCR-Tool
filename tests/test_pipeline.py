@@ -33,8 +33,6 @@ def make_config(tmp_path, **overrides) -> Config:
         config_file_name="DEPOT Config.json",
         config_subfolder="Config",
         processed_subfolder="Processed",
-        file_into_dokumente=True,
-        save_processed_copy=False,
         ocr_language="deu",
         max_concurrent_jobs=1,
         state_db_path=str(tmp_path / "state.sqlite3"),
@@ -383,12 +381,20 @@ def test_scan_eingang_is_always_excluded_even_when_nested_under_dokumente(tmp_pa
     p.state.close()
 
 
-# ---- FILE_INTO_DOKUMENTE / SAVE_PROCESSED_COPY switches -------------------
+# ---- file_into_dokumente / save_processed_copy switches (DEPOT Config.json) ---
+
+def _write_processing_switches(tmp_path, config_subfolder="Config", **switches):
+    import json
+    config_dir = tmp_path / config_subfolder
+    config_dir.mkdir(exist_ok=True)
+    (config_dir / "DEPOT Config.json").write_text(json.dumps(switches), encoding="utf-8")
+
 
 def test_filing_disabled_skips_folder_walk_and_only_extracts_content(monkeypatch, tmp_path, fake_server, client):
     from datetime import date
     scan = _make_scan(tmp_path)
-    p = _make_pipeline(tmp_path, client, file_into_dokumente=False, save_processed_copy=True)
+    _write_processing_switches(tmp_path, file_into_dokumente=False, save_processed_copy=True)
+    p = _make_pipeline(tmp_path, client)
     _seed_source_on_server(p, client, scan)
     ocr_pdf = _make_ocr_pdf(tmp_path)
 
@@ -419,7 +425,8 @@ def test_filing_disabled_skips_folder_walk_and_only_extracts_content(monkeypatch
 
 
 def test_save_processed_copy_alongside_normal_filing(monkeypatch, tmp_path, fake_server, client):
-    p = _make_pipeline(tmp_path, client, save_processed_copy=True)
+    _write_processing_switches(tmp_path, save_processed_copy=True)
+    p = _make_pipeline(tmp_path, client)
     scan = _make_scan(tmp_path)
     _seed_source_on_server(p, client, scan)
     ocr_pdf = _make_ocr_pdf(tmp_path)
@@ -444,4 +451,43 @@ def test_save_processed_copy_alongside_normal_filing(monkeypatch, tmp_path, fake
     processed = [f for f in fake_server.files if f.startswith("Scan-Eingang/Config/Processed/")]
     assert len(filed) == 1
     assert len(processed) == 1
+    p.state.close()
+
+
+def test_switch_takes_effect_on_next_document_without_restart(monkeypatch, tmp_path, fake_server, client):
+    """The whole point of reading DEPOT Config.json fresh per document
+    instead of once at startup: editing it in Nextcloud mid-batch changes
+    behavior for the very next scan, no container restart needed."""
+    p = _make_pipeline(tmp_path, client)
+    scan1 = _make_scan(tmp_path, name="scan1.pdf")
+    scan2 = _make_scan(tmp_path, name="scan2.pdf")
+    _seed_source_on_server(p, client, scan1)
+    _seed_source_on_server(p, client, scan2)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **kwargs: (
+            ClassificationOutcome(folder="Dokumente/Gesundheit", is_new_folder=False, title="Doc", confidence=0.9),
+            [],
+        ),
+    )
+    monkeypatch.setattr(
+        classifier, "extract_content",
+        lambda *a, **k: ContentExtraction(title="Doc", confidence=0.9),
+    )
+
+    p.process_one(scan1)  # no DEPOT Config.json yet -> default: filing on
+    _make_ocr_pdf(tmp_path)  # scan1's processing deleted the (non-raw) OCR output file
+    _write_processing_switches(tmp_path, file_into_dokumente=False, save_processed_copy=True)
+    p.process_one(scan2)  # same running pipeline, switch flipped between calls
+
+    filed = [f for f in fake_server.files if f.startswith("Dokumente/Gesundheit/")]
+    processed = [f for f in fake_server.files if f.startswith("Scan-Eingang/Config/Processed/")]
+    assert len(filed) == 1  # only scan1
+    assert len(processed) == 1  # only scan2
     p.state.close()

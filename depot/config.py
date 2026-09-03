@@ -15,13 +15,6 @@ def _require(name: str) -> str:
     return value
 
 
-def _bool(name: str, default: bool) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in ("1", "true", "yes", "on")
-
-
 @dataclass(frozen=True)
 class Config:
     nextcloud_webdav_url: str
@@ -43,21 +36,11 @@ class Config:
     config_file_name: str
     config_subfolder: str
     processed_subfolder: str
-    file_into_dokumente: bool
-    save_processed_copy: bool
     ocr_language: str
     max_concurrent_jobs: int
     state_db_path: str
 
     supported_extensions: frozenset[str]
-
-    def __post_init__(self) -> None:
-        if not self.file_into_dokumente and not self.save_processed_copy:
-            raise RuntimeError(
-                "Both FILE_INTO_DOKUMENTE and SAVE_PROCESSED_COPY are disabled - DEPOT "
-                "would have nowhere to put a processed document before deleting the "
-                "source scan. Enable at least one of them."
-            )
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -97,8 +80,6 @@ class Config:
             config_file_name=os.environ.get("CONFIG_FILE_NAME", "DEPOT Config.json"),
             config_subfolder=config_subfolder,
             processed_subfolder=os.environ.get("PROCESSED_SUBFOLDER", "Processed").strip("/"),
-            file_into_dokumente=_bool("FILE_INTO_DOKUMENTE", True),
-            save_processed_copy=_bool("SAVE_PROCESSED_COPY", False),
             ocr_language=os.environ.get("OCR_LANGUAGE", "deu"),
             max_concurrent_jobs=int(os.environ.get("MAX_CONCURRENT_JOBS", "1")),
             state_db_path=os.environ.get(

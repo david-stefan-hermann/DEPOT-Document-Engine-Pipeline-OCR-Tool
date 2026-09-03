@@ -213,6 +213,14 @@ class Pipeline:
         original_name = path.name
         today = date.today()
 
+        # Read fresh per document (cheap local file read) rather than at
+        # startup, so the user can toggle these directly in DEPOT
+        # Config.json in Nextcloud and have it take effect on the very next
+        # scan, the same way excluded_folders already works.
+        file_into_dokumente, save_processed_copy = scan_config.load_processing_switches(
+            cfg.scan_eingang_local_path, cfg.config_subfolder, cfg.config_file_name
+        )
+
         ocr_result = ocr.process_file(path, cfg.ocr_language)
         produced_path = Path(ocr_result.ocr_pdf_path)
         using_raw_original = produced_path == path
@@ -227,10 +235,10 @@ class Pipeline:
             issue_date = None
             confidence = 0.0
             tags.append(depotlog.TAG_OCR_FAILED)
-            if cfg.file_into_dokumente:
+            if file_into_dokumente:
                 target_folder = cfg.fallback_folder
                 tags.append(depotlog.TAG_UNSORTED)
-        elif cfg.file_into_dokumente:
+        elif file_into_dokumente:
             existing_folders = self._get_existing_folders()
             result, classifier_tags = classifier.classify(
                 ocr_text=ocr_result.text,
@@ -279,7 +287,7 @@ class Pipeline:
             dest_rel = self._put_with_collision_resolution(target_folder, desired_name, produced_bytes)
 
         processed_rel: str | None = None
-        if cfg.save_processed_copy:
+        if save_processed_copy:
             processed_folder = (
                 f"{cfg.scan_eingang_webdav_path}/{cfg.config_subfolder}/{cfg.processed_subfolder}"
             )
@@ -287,10 +295,11 @@ class Pipeline:
             tags.append(depotlog.TAG_PROCESSED_COPY)
 
         if dest_rel is None and processed_rel is None:
-            # Defense in depth: Config already refuses to start with both
-            # switches off, so this should be unreachable - but if it ever
-            # happens anyway, refuse to delete the source rather than lose
-            # the processed document. Caught by process_one() as a
+            # Defense in depth: load_processing_switches() already forces
+            # file_into_dokumente back to True when DEPOT Config.json has
+            # both switches false, so this should be unreachable - but if it
+            # ever happens anyway, refuse to delete the source rather than
+            # lose the processed document. Caught by process_one() as a
             # permanent-looking failure; the scan stays in Scan-Eingang.
             raise RuntimeError(
                 "Neither filing nor the processed-copy produced a stored destination; "

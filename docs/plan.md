@@ -54,14 +54,17 @@ Fehlzuordnungen manuell in Nextcloud zu korrigieren.
   Log markiert.
 - **Neue Ordner:** werden automatisch nach dem Namensmuster bestehender Ordner angelegt,
   aber im Log besonders hervorgehoben, damit der Nutzer sie kurz gegenprüfen kann.
-- **Einsortierung optional abschaltbar (`FILE_INTO_DOKUMENTE`, Default an):** wenn aus,
-  entfällt der komplette Ordner-Abstieg (spart die Ollama-Aufrufe dafür) — es werden nur
-  Titel/Datum/Absender extrahiert, nichts landet unter `Dokumente/`.
-- **Zusätzliche flache Kopie optional (`SAVE_PROCESSED_COPY`, Default aus):** legt jedes
-  verarbeitete Dokument zusätzlich (oder bei abgeschalteter Einsortierung: ausschließlich)
-  umbenannt+durchsuchbar flach unter `Scan Eingang/Depot Config/Processed/` ab. Mindestens
-  einer der beiden Schalter muss an sein — DEPOT startet sonst gar nicht erst (sähe sich
-  sonst gezwungen, den Scan zu löschen, ohne das Ergebnis irgendwo abgelegt zu haben).
+- **Einsortierung optional abschaltbar (`file_into_dokumente` in `DEPOT Config.json`,
+  Default an):** wenn aus, entfällt der komplette Ordner-Abstieg (spart die Ollama-Aufrufe
+  dafür) — es werden nur Titel/Datum/Absender extrahiert, nichts landet unter `Dokumente/`.
+- **Zusätzliche flache Kopie optional (`save_processed_copy` in `DEPOT Config.json`,
+  Default aus):** legt jedes verarbeitete Dokument zusätzlich (oder bei abgeschalteter
+  Einsortierung: ausschließlich) umbenannt+durchsuchbar flach unter `Scan Eingang/
+  Depot Config/Processed/` ab. Sind beide Schalter aus, gewinnt intern `file_into_dokumente`
+  (mit Warnung geloggt) — DEPOT würde sonst den Scan löschen, ohne das Ergebnis irgendwo
+  abgelegt zu haben. Bewusst genau wie `excluded_folders` direkt in `DEPOT Config.json`
+  steuerbar (nicht per Env-Var): wird bei jeder Datei frisch neu gelesen, eine Änderung in
+  Nextcloud wirkt also sofort auf die nächste Datei, ohne Container-Neustart.
 
 ## Architektur / Datenfluss
 
@@ -93,7 +96,7 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │           könnte der Klassifikator ein Dokument in/unter den Scan-Eingang zurück-
    │           einsortieren und der Watcher würde es erneut aufgreifen (Endlosschleife)
    │
-   ├─► classifier.py — nur wenn FILE_INTO_DOKUMENTE aktiv ist (sonst nur Schritt 1),
+   ├─► classifier.py — nur wenn file_into_dokumente aktiv ist (sonst nur Schritt 1),
    │   zwei getrennte Schritte statt einem Aufruf mit der ganzen Ordnerliste auf einmal
    │   (Grund: bei einer sehr großen/tiefen Struktur verliert ein kleines Modell sonst
    │   den Faden und wählt Unsinn — real aufgetreten):

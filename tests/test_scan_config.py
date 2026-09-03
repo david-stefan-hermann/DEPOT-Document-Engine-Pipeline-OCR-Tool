@@ -68,3 +68,52 @@ def test_filter_excluded_does_not_remove_similarly_named_sibling():
 def test_filter_excluded_no_exclusions_returns_same_list():
     folders = ["Dokumente/Gesundheit"]
     assert scan_config.filter_excluded(folders, []) == folders
+
+
+# ---- load_processing_switches ---------------------------------------------
+
+def test_load_processing_switches_missing_file_returns_defaults(tmp_path):
+    assert scan_config.load_processing_switches(str(tmp_path), "Config", "DEPOT Config.json") == (True, False)
+
+
+def test_load_processing_switches_reads_both_values(tmp_path):
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(
+        json.dumps({"file_into_dokumente": False, "save_processed_copy": True}), encoding="utf-8"
+    )
+    assert scan_config.load_processing_switches(str(tmp_path), "Config", "DEPOT Config.json") == (False, True)
+
+
+def test_load_processing_switches_missing_keys_use_defaults(tmp_path):
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(json.dumps({}), encoding="utf-8")
+    assert scan_config.load_processing_switches(str(tmp_path), "Config", "DEPOT Config.json") == (True, False)
+
+
+def test_load_processing_switches_non_bool_values_fall_back_to_defaults(tmp_path):
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(
+        json.dumps({"file_into_dokumente": "nope", "save_processed_copy": 1}), encoding="utf-8"
+    )
+    assert scan_config.load_processing_switches(str(tmp_path), "Config", "DEPOT Config.json") == (True, False)
+
+
+def test_load_processing_switches_both_false_falls_back_to_filing_enabled(tmp_path):
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text(
+        json.dumps({"file_into_dokumente": False, "save_processed_copy": False}), encoding="utf-8"
+    )
+    # Never both False - DEPOT would have nowhere to put a processed
+    # document before deleting the source scan.
+    assert scan_config.load_processing_switches(str(tmp_path), "Config", "DEPOT Config.json") == (True, False)
+
+
+def test_load_processing_switches_malformed_json_returns_defaults(tmp_path):
+    config_dir = tmp_path / "Config"
+    config_dir.mkdir()
+    (config_dir / "DEPOT Config.json").write_text("{not valid json", encoding="utf-8")
+    assert scan_config.load_processing_switches(str(tmp_path), "Config", "DEPOT Config.json") == (True, False)

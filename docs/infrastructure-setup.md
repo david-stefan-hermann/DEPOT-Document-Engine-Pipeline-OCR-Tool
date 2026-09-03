@@ -251,8 +251,9 @@ Dockge auf den `depot`-Stack den **Update**-Button klicken.
 ## Migration: Scan Eingang unter Dokumente/, Config-Umbenennung (2026-09-03)
 
 Diese Session hat sowohl Code (Confidence-Cap bei ungültiger Ordnerwahl, Absender-Feld,
-FILE_INTO_DOKUMENTE/SAVE_PROCESSED_COPY-Schalter) als auch die empfohlene Ordnerstruktur
-geändert. Damit das auf dem echten Server ankommt, sind folgende manuellen Schritte nötig
+`file_into_dokumente`/`save_processed_copy`-Schalter in `DEPOT Config.json`) als auch die
+empfohlene Ordnerstruktur geändert. Damit das auf dem echten Server ankommt, sind folgende
+manuellen Schritte nötig
 (kein Skript, da DEPOT selbst keine Nextcloud-Zugangsdaten in dieser Session hat und ein
 automatischer Ordner-Move auf echten Nutzerdaten ohnehin lieber vom Nutzer selbst
 gegengeprüft wird):
@@ -280,3 +281,11 @@ gegengeprüft wird):
    den kompletten `files`-Root ab, es ändert sich nur der Unterpfad.
 6. In Dockge: **Update** klicken (holt das neue Image mit den Code-Änderungen UND
    übernimmt die geänderte `.env` beim Neustart des Containers).
+7. Optional: `file_into_dokumente`/`save_processed_copy` in `DEPOT Config.json` setzen
+   (Default entspricht dem bisherigen Verhalten, also nur nötig bei gewünschter
+   Abweichung), z.B.:
+   ```json
+   { "excluded_folders": [], "file_into_dokumente": true, "save_processed_copy": false }
+   ```
+   Wird bei jeder Datei frisch gelesen — eine Änderung wirkt sofort auf die nächste Datei,
+   kein Neustart nötig (anders als die `.env`-Werte oben).
