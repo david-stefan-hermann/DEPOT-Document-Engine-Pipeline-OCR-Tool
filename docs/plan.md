@@ -142,6 +142,15 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │        Ein-Optionen-Kaskaden-Problem — reale Fehlklassifikation, per Live-Test
    │        gegen die echte Ordnerstruktur bestätigt, noch nicht behoben.
    │
+   │        **Determinismus (2026-09-03):** beide Ollama-Aufrufe liefen mit
+   │        `temperature=0.1` OHNE festen `seed` — ein Live-A/B-Test zeigte, dasselbe
+   │        Dokument lieferte über 4 Wiederholungen 2 unterschiedliche Titel-
+   │        Formulierungen, mit `temperature=0` + festem `seed` dagegen 4/4 mal exakt
+   │        dasselbe Ergebnis. Beide Aufrufe nutzen jetzt `temperature=0, seed=42`
+   │        (`classifier._OLLAMA_OPTIONS`) — es gibt keinen Vorteil durch kreative
+   │        Variation bei einer Aufgabe, bei der dasselbe Dokument immer gleich
+   │        einsortiert werden soll.
+   │
    ├─► naming.py: Titel sanitizen, Datum validieren, Dateiname
    │           "YYYY-MM-DD [Absender - ]Titel.ext" bauen, Kollisionen auflösen
    │           ("(2)", "(3)", …)
@@ -195,6 +204,18 @@ Stromrechnung Juli.pdf`, ohne erkennbaren Absender weiterhin schlicht
 `2026-07-15 Stromrechnung Juli.pdf`. Fehlt ein erkennbares Datum, wird das
 Verarbeitungsdatum verwendet, der Titel erhält den Zusatz "(Datum unsicher)" und der
 Logeintrag wird mit `[DATUM-UNSICHER]` markiert.
+
+**Titel-Qualität nachgeschärft (2026-09-03), anhand zweier realer schlechter Titel aus der
+Produktion:** (1) ein persönlich adressierter Brief ohne offiziellen Formularnamen bekam
+den generischen Titel "Bürgerbrief" statt eines Titels, der das tatsächliche Anliegen
+nennt — Prompt-Regel ergänzt: bei einem freien Brief (Anrede "Sehr geehrte(r)...", kein
+Formular) den Titel aus dem Inhalt/Thema ableiten, nie eine generische Textsorten-
+Bezeichnung. Live verifiziert: derselbe Brief liefert jetzt "Schreiben über Änderung der
+Steuerklasse" statt "Bürgerbrief". (2) ein TÜV-Prüfbericht bekam keinen Hinweis auf das
+geprüfte Fahrzeug — Prompt-Regel ergänzt: bei einem Dokument zu einem konkreten, ggf.
+mehrfach vorhandenen physischen Objekt (Fahrzeug, Gerät) eine im Text vorhandene eindeutige
+Kennung (amtliches Kennzeichen, Seriennummer) mit in den Titel aufnehmen. Live verifiziert:
+"Prüfbericht B-XY 1234" statt nur "Prüfbericht".
 
 **Absender als eigenes Feld (statt Teil des freien Titels):** Recherche zu bestehenden
 Lösungen (v.a. paperless-ngx, das Korrespondent/Dokumenttyp/Titel als getrennte Felder

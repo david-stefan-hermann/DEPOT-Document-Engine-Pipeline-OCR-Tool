@@ -15,6 +15,15 @@ log = logging.getLogger(__name__)
 
 MAX_OCR_CHARS = 3500
 
+# temperature=0.1 (without a fixed seed) still produced visibly different
+# answers for the exact same document across repeated runs (confirmed via a
+# live A/B test: the same letter's title flip-flopped between two phrasings
+# across 4 runs at temperature=0.1, but was byte-identical across 4 runs at
+# temperature=0 + a fixed seed). Since there is no benefit to creative
+# variation here - a given document should always file the same way - both
+# calls use fully deterministic sampling.
+_OLLAMA_OPTIONS = {"temperature": 0.0, "seed": 42}
+
 # Above this similarity ratio, a proposed folder name is treated as referring
 # to an already-existing sibling (e.g. "Rechnung" vs "Rechnungen") and gets
 # redirected/corrected instead of creating a near-duplicate or giving up.
@@ -82,6 +91,22 @@ Ausnahmefall, nicht der Normalfall. Der Absender darf NICHT nochmal im \
 steht bereits in "correspondent"), ohne Datum, ohne Dateiendung und ohne \
 Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli" oder "Bussgeldbescheid". \
 Referenznummern gehoeren NIEMALS in den Titel.
+- Hat das Dokument einen offiziellen Formular-/Dokumenttyp-Namen (Rechnung, \
+Bescheid, Bescheinigung, Mahnung, Pruefbericht, Vertrag, ...), nutze GENAU \
+diesen als Kern des Titels. Ist es dagegen ein freier, persoenlich \
+adressierter Brief OHNE einen solchen offiziellen Dokumenttyp (erkennbar an \
+"Sehr geehrte(r) ...", einer direkten Anrede, einem freien Anliegen statt \
+einem Formular), leite den Titel aus dem TATSAECHLICHEN Anliegen/Thema des \
+Brieftexts ab (worum es inhaltlich geht) - NIEMALS eine generische \
+Bezeichnung wie "Schreiben", "Mitteilung" oder "Buergerbrief" verwenden, \
+die nur die Textsorte statt des Inhalts benennt.
+- Bezieht sich das Dokument erkennbar auf ein konkretes physisches Objekt, \
+das der Nutzer mehrfach besitzen koennte (z.B. ein Fahrzeug, ein \
+Geraet), und steht im Text eine eindeutige Kennung dafuer (amtliches \
+Kennzeichen, Seriennummer, Fahrgestellnummer), nimm diese Kennung mit in \
+den Titel auf - das unterscheidet sonst gleichnamige Dokumente \
+(z.B. "Pruefbericht B-XY 123" statt nur "Pruefbericht"). Das ist KEINE \
+Rechnungs-/Kundennummer und faellt nicht unter das Verbot oben.
 - "issue_date" ist das Ausstellungs-/Rechnungsdatum des Dokuments im Format \
 YYYY-MM-DD, oder null falls nicht ermittelbar. Deutsche Datumsangaben im Text \
 sind TT.MM.JJJJ (Tag zuerst) - wandle sie sorgfaeltig um, ohne Ziffern zu \
@@ -187,7 +212,7 @@ def extract_content(
         model=model,
         messages=messages,
         format=ContentExtraction.model_json_schema(),
-        options={"temperature": 0.1},
+        options=_OLLAMA_OPTIONS,
     )
     raw_content = response["message"]["content"]
     try:
@@ -212,7 +237,7 @@ def _decide_folder_step(
         model=model,
         messages=messages,
         format=FolderStepDecision.model_json_schema(),
-        options={"temperature": 0.1},
+        options=_OLLAMA_OPTIONS,
     )
     raw_content = response["message"]["content"]
     try:
