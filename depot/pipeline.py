@@ -73,6 +73,14 @@ class Pipeline:
                     self.config.config_subfolder,
                     self.config.config_file_name,
                 )
+                # Structural, non-optional exclusion (on top of whatever the
+                # user configured): the scan inbox itself must never be
+                # offered as a filing target. This matters most when
+                # Scan-Eingang lives inside Dokumente/ - without this, the
+                # classifier could file a document straight back into (or
+                # under) the folder the watcher watches, which would pick it
+                # up again and reprocess it in a loop.
+                excluded = [*excluded, self.config.scan_eingang_webdav_path]
                 self._folder_cache = scan_config.filter_excluded(folders, excluded)
                 self._folder_cache_time = now
             return list(self._folder_cache)
@@ -181,8 +189,24 @@ class Pipeline:
         return dest_rel
 
     def _delete_source(self, original_name: str) -> None:
+        # Hardcoded to the scan inbox on purpose: this is the ONLY place in
+        # the whole codebase that ever calls webdav.delete(), and it must
+        # never be reachable with a path derived from anywhere else (e.g.
+        # Dokumente/). Folders are never deleted anywhere in this codebase.
         src_rel = f"{self.config.scan_eingang_webdav_path}/{original_name}"
         self.webdav.delete(src_rel)
+
+    def _put_with_collision_resolution(self, folder: str, desired_name: str, data: bytes) -> str:
+        self.webdav.mkcol(folder)
+        existing_names = {
+            e.path.rsplit("/", 1)[-1]
+            for e in self.webdav.list_dir(folder)
+            if not e.is_collection
+        }
+        final_name = naming.resolve_collision(desired_name, existing_names)
+        dest_rel = f"{folder}/{final_name}"
+        self.webdav.put(dest_rel, data)
+        return dest_rel
 
     def _process(self, path: Path) -> None:
         cfg = self.config
@@ -195,15 +219,18 @@ class Pipeline:
         ext = path.suffix.lstrip(".") if using_raw_original else "pdf"
 
         tags: list[str] = []
+        target_folder: str | None = None
 
         if ocr_result.ocr_failed:
-            target_folder = cfg.fallback_folder
             title = path.stem
             correspondent = None
             issue_date = None
             confidence = 0.0
-            tags += [depotlog.TAG_OCR_FAILED, depotlog.TAG_UNSORTED]
-        else:
+            tags.append(depotlog.TAG_OCR_FAILED)
+            if cfg.file_into_dokumente:
+                target_folder = cfg.fallback_folder
+                tags.append(depotlog.TAG_UNSORTED)
+        elif cfg.file_into_dokumente:
             existing_folders = self._get_existing_folders()
             result, classifier_tags = classifier.classify(
                 ocr_text=ocr_result.text,
@@ -226,31 +253,59 @@ class Pipeline:
                 target_folder = result.folder
                 if result.is_new_folder:
                     tags.append(depotlog.TAG_NEW_FOLDER)
+        else:
+            # Filing is switched off: only title/date/correspondent for the
+            # filename are needed, not a filing decision - skip the folder
+            # walk entirely (saves the WebDAV folder listing and several
+            # Ollama calls it would otherwise cost).
+            content = classifier.extract_content(
+                ocr_result.text, original_name, cfg.ollama_host, cfg.ollama_model
+            )
+            confidence = content.confidence
+            title = content.title
+            correspondent = content.correspondent
+            issue_date = content.issue_date
+            tags.append(depotlog.TAG_FILING_DISABLED)
 
         if issue_date is None:
             tags.append(depotlog.TAG_DATE_UNCERTAIN)
 
-        self.webdav.mkcol(target_folder)
-        self._remember_folder(target_folder)
         desired_name = naming.build_filename(title, issue_date, today, ext=ext, correspondent=correspondent)
-        existing_names = {
-            e.path.rsplit("/", 1)[-1]
-            for e in self.webdav.list_dir(target_folder)
-            if not e.is_collection
-        }
-        final_name = naming.resolve_collision(desired_name, existing_names)
-        dest_rel = f"{target_folder}/{final_name}"
+        produced_bytes = produced_path.read_bytes()
 
-        self.webdav.put(dest_rel, produced_path.read_bytes())
+        dest_rel: str | None = None
+        if target_folder is not None:
+            self._remember_folder(target_folder)
+            dest_rel = self._put_with_collision_resolution(target_folder, desired_name, produced_bytes)
+
+        processed_rel: str | None = None
+        if cfg.save_processed_copy:
+            processed_folder = (
+                f"{cfg.scan_eingang_webdav_path}/{cfg.config_subfolder}/{cfg.processed_subfolder}"
+            )
+            processed_rel = self._put_with_collision_resolution(processed_folder, desired_name, produced_bytes)
+            tags.append(depotlog.TAG_PROCESSED_COPY)
+
+        if dest_rel is None and processed_rel is None:
+            # Defense in depth: Config already refuses to start with both
+            # switches off, so this should be unreachable - but if it ever
+            # happens anyway, refuse to delete the source rather than lose
+            # the processed document. Caught by process_one() as a
+            # permanent-looking failure; the scan stays in Scan-Eingang.
+            raise RuntimeError(
+                "Neither filing nor the processed-copy produced a stored destination; "
+                "refusing to delete the source scan."
+            )
+
         self._delete_source(original_name)
 
         if not using_raw_original:
             produced_path.unlink(missing_ok=True)
 
-        self.depot_log.append(
-            original_name,
-            f"confidence={confidence:.2f}",
-            tags=tags,
-            path=dest_rel,
-        )
-        log.info("Filed %s -> %s (confidence=%.2f)", original_name, dest_rel, confidence)
+        message = f"confidence={confidence:.2f}"
+        if dest_rel and processed_rel:
+            message += f" | Kopie: {processed_rel}"
+        log_path = dest_rel or processed_rel
+
+        self.depot_log.append(original_name, message, tags=tags, path=log_path)
+        log.info("Processed %s -> %s (confidence=%.2f)", original_name, log_path, confidence)

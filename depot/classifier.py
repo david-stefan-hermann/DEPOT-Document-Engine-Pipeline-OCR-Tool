@@ -25,6 +25,16 @@ NEAR_DUPLICATE_THRESHOLD = 0.85
 # "new_folder") - just a guard against something looping pathologically.
 MAX_DEPTH = 12
 
+# When the model hallucinates a folder choice (a "descend" target that isn't
+# one of the offered children with no close fuzzy match, or a "new_folder"
+# with no name), that step's *reported* confidence is not trustworthy - a
+# model that confabulates a folder is not meaningfully more reliable when it
+# also claims to be 95% sure about it. Hard-cap the step confidence instead
+# of trusting the model's own number, so these cases reliably fall through
+# to the fallback folder (below CONFIDENCE_THRESHOLD) instead of silently
+# landing one level too shallow with a falsely high confidence.
+INVALID_CHOICE_CONFIDENCE_CAP = 0.2
+
 
 class ClassificationOutcome(NamedTuple):
     folder: str
@@ -41,9 +51,13 @@ Du extrahierst Kerninformationen aus einem gescannten Dokument.
 Regeln:
 - "correspondent" ist der Absender/Aussteller des Dokuments (Firma, Behoerde, \
 Institution) - kurz und wiedererkennbar, z.B. "Stadtwerke Muenchen" statt \
-"Stadtwerke Muenchen Servicegesellschaft mbH", oder null falls kein klarer \
-Absender erkennbar ist (z.B. private Notizen). Der Absender darf NICHT \
-nochmal im "title" wiederholt werden.
+"Stadtwerke Muenchen Servicegesellschaft mbH". Steht im Briefkopf/der \
+Absenderzeile z.B. "Finanzamt Muenchen" oder nur "Finanzamt", nutze GENAU \
+das als correspondent (nicht null, nur weil kein Firmenname im Sinne einer \
+GmbH vorliegt - auch Behoerden, Aemter und Kassen sind ein correspondent). \
+Nur bei WIRKLICH keinem erkennbaren Absender (z.B. private Notizen) ist \
+correspondent null. Der Absender darf NICHT nochmal im "title" wiederholt \
+werden.
 - "title" ist ein kurzer, praegnanter Betreff OHNE den Absendernamen (der \
 steht bereits in "correspondent"), ohne Datum, ohne Dateiendung und ohne \
 Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli" oder "Bussgeldbescheid". \
@@ -68,13 +82,18 @@ Du bekommst die AKTUELLE Ordner-Ebene und deren direkte Unterordner. \
 Entscheide NUR, was auf DIESER Ebene als naechstes passiert:
 - "descend": einer der angebotenen Unterordner passt eindeutig besser als \
 die aktuelle Ebene - dann geht es dort eine Ebene tiefer weiter. \
-"folder_name" muss EXAKT einem der angebotenen Namen entsprechen.
+"folder_name" muss EXAKT einem der oben angebotenen Namen entsprechen - \
+WICHTIG: erfinde hier NIEMALS einen Namen, der nicht woertlich in der Liste \
+steht, auch wenn er passender klaenge. Ist kein Name aus der Liste wirklich \
+passend, nutze stattdessen "stay" oder "new_folder".
 - "stay": keiner der angebotenen Unterordner passt besser als die aktuelle \
 Ebene selbst - das Dokument wird direkt hier abgelegt.
 - "new_folder": keiner der angebotenen Unterordner passt, aber ein neuer, \
 sinnvoll benannter Unterordner ist hier gerechtfertigt (Stil/Sprache/ \
-Gross-Kleinschreibung der bestehenden Ordner beachten). "folder_name" ist \
-NUR der Name des neuen Ordners, kein Pfad.
+Gross-Kleinschreibung der bestehenden Ordner beachten) - das ist der \
+richtige Weg fuer einen Ordnernamen, der dir zwar sinnvoll erscheint, aber \
+NICHT in der Liste der angebotenen Unterordner steht. "folder_name" ist NUR \
+der Name des neuen Ordners, kein Pfad.
 - "confidence" ist deine Einschaetzung (0.0-1.0), wie sicher du bei DIESER \
 EINEN Entscheidung bist.
 - Antworte AUSSCHLIESSLICH mit einem JSON-Objekt passend zum vorgegebenen Schema.
@@ -228,11 +247,13 @@ def _walk_folder_tree(
                 decision.folder_name, current_path,
             )
             tags.append("UNGUELTIGE-ORDNERWAHL")
+            confidences[-1] = min(confidences[-1], INVALID_CHOICE_CONFIDENCE_CAP)
             break
 
         if decision.action == "new_folder":
             if not decision.folder_name:
                 tags.append("UNGUELTIGE-ORDNERWAHL")
+                confidences[-1] = min(confidences[-1], INVALID_CHOICE_CONFIDENCE_CAP)
                 break
             match = closest_existing_leaf(decision.folder_name, children)
             if match is not None and match[1] >= NEAR_DUPLICATE_THRESHOLD:

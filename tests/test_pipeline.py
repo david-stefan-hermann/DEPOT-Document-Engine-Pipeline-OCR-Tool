@@ -9,7 +9,7 @@ from depot import classifier, ocr
 from depot.classifier import ClassificationOutcome
 from depot.config import Config
 from depot.depotlog import DepotLog
-from depot.models import OcrResult
+from depot.models import ContentExtraction, OcrResult
 from depot.pipeline import Pipeline
 from depot.state import StateStore
 
@@ -32,6 +32,9 @@ def make_config(tmp_path, **overrides) -> Config:
         log_file_prefix="DEPOT Dateilog",
         config_file_name="DEPOT Config.json",
         config_subfolder="Config",
+        processed_subfolder="Processed",
+        file_into_dokumente=True,
+        save_processed_copy=False,
         ocr_language="deu",
         max_concurrent_jobs=1,
         state_db_path=str(tmp_path / "state.sqlite3"),
@@ -41,16 +44,20 @@ def make_config(tmp_path, **overrides) -> Config:
     return Config(**defaults)
 
 
-@pytest.fixture
-def pipeline(tmp_path, fake_server, client):
-    config = make_config(tmp_path)
+def _make_pipeline(tmp_path, client, **config_overrides) -> Pipeline:
+    config = make_config(tmp_path, **config_overrides)
     depot_log = DepotLog(
         client, config.scan_eingang_webdav_path, config.log_file_prefix, config.config_subfolder
     )
     state = StateStore(config.state_db_path)
-    p = Pipeline(config, webdav=client, depot_log=depot_log, state=state)
+    return Pipeline(config, webdav=client, depot_log=depot_log, state=state)
+
+
+@pytest.fixture
+def pipeline(tmp_path, fake_server, client):
+    p = _make_pipeline(tmp_path, client)
     yield p
-    state.close()
+    p.state.close()
 
 
 def _make_scan(tmp_path, name="scan1.pdf", content=b"%PDF-raw-scan") -> Path:
@@ -355,3 +362,86 @@ def test_excluded_folders_from_config_file_are_never_offered(tmp_path, pipeline,
 
     assert "Dokumente/Gesundheit" in folders
     assert not any(f.startswith("Dokumente/Games") for f in folders)
+
+
+def test_scan_eingang_is_always_excluded_even_when_nested_under_dokumente(tmp_path, client):
+    """If Scan-Eingang lives inside Dokumente/, it must never be offered as
+    a filing target - otherwise the classifier could file a document back
+    into the folder the watcher watches, reprocessing it in a loop. This
+    exclusion is structural, not dependent on the user's own
+    excluded_folders config."""
+    client.mkcol("Dokumente/Scan Eingang")
+    client.mkcol("Dokumente/Scan Eingang/Depot Config")
+    client.mkcol("Dokumente/Gesundheit")
+
+    p = _make_pipeline(tmp_path, client, scan_eingang_webdav_path="Dokumente/Scan Eingang")
+
+    folders = p._get_existing_folders()
+
+    assert "Dokumente/Gesundheit" in folders
+    assert not any(f.startswith("Dokumente/Scan Eingang") for f in folders)
+    p.state.close()
+
+
+# ---- FILE_INTO_DOKUMENTE / SAVE_PROCESSED_COPY switches -------------------
+
+def test_filing_disabled_skips_folder_walk_and_only_extracts_content(monkeypatch, tmp_path, fake_server, client):
+    from datetime import date
+    scan = _make_scan(tmp_path)
+    p = _make_pipeline(tmp_path, client, file_into_dokumente=False, save_processed_copy=True)
+    _seed_source_on_server(p, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="Stromrechnung Juli", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+
+    def _classify_should_not_be_called(**kwargs):
+        raise AssertionError("classifier.classify must not be called when filing is disabled")
+
+    monkeypatch.setattr(classifier, "classify", _classify_should_not_be_called)
+    monkeypatch.setattr(
+        classifier, "extract_content",
+        lambda *a, **k: ContentExtraction(
+            title="Stromrechnung Juli", correspondent="Stadtwerke", issue_date=date(2026, 7, 15), confidence=0.9
+        ),
+    )
+
+    p.process_one(scan)
+
+    assert not any(f.startswith("Dokumente/") for f in fake_server.files)
+    processed = [f for f in fake_server.files if f.startswith("Scan-Eingang/Config/Processed/")]
+    assert len(processed) == 1
+    assert "Stadtwerke" in processed[0]
+    assert client.get(f"Scan-Eingang/{scan.name}") is None  # source still removed
+    p.state.close()
+
+
+def test_save_processed_copy_alongside_normal_filing(monkeypatch, tmp_path, fake_server, client):
+    p = _make_pipeline(tmp_path, client, save_processed_copy=True)
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(p, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **kwargs: (
+            ClassificationOutcome(
+                folder="Dokumente/Gesundheit", is_new_folder=False, title="Rezept", confidence=0.9
+            ),
+            [],
+        ),
+    )
+
+    p.process_one(scan)
+
+    filed = [f for f in fake_server.files if f.startswith("Dokumente/Gesundheit/")]
+    processed = [f for f in fake_server.files if f.startswith("Scan-Eingang/Config/Processed/")]
+    assert len(filed) == 1
+    assert len(processed) == 1
+    p.state.close()

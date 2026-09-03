@@ -4,8 +4,11 @@
 
 Der Nutzer sammelt physische Post (Rechnungen, Behördenbriefe, Gehaltsabrechnungen,
 Versicherungsunterlagen, Motorrad-Rechnungen, Bußgeldbescheide etc.) und scannt sie in
-unregelmäßigen Abständen batchweise in einen `Scan-Eingang`-Ordner in seiner
-selbstgehosteten Nextcloud (TrueNAS Scale, Docker, WebDAV-Zugriff). Danach durchläuft er
+unregelmäßigen Abständen batchweise in einen `Scan Eingang`-Ordner in seiner
+selbstgehosteten Nextcloud (TrueNAS Scale, Docker, WebDAV-Zugriff) — bewusst INNERHALB von
+`Dokumente/` (`Dokumente/Scan Eingang`), damit alles ein zusammenhängender Baum bleibt;
+DEPOT schließt den Scan-Eingang-Pfad strukturell von der Klassifikation aus (siehe unten),
+sodass das gefahrlos möglich ist. Danach durchläuft er
 für **jeden** Scan manuell: Inhalt lesen, Ausstellungsdatum ermitteln, Datei sinnvoll
 umbenennen, den passenden (mehrere Ebenen tiefen) Unterordner in der bereits gut
 gepflegten `Dokumente/`-Struktur suchen oder neu anlegen, Datei dort ablegen. Das ist bei
@@ -37,11 +40,11 @@ Fehlzuordnungen manuell in Nextcloud zu korrigieren.
 - **OCR:** Tesseract + Preprocessing (nicht Vision-LLM), CPU-basiert, deutsches
   Sprachpaket. Ein kleines Text-LLM (Ollama) übernimmt ausschließlich die
   Klassifikationsentscheidung.
-- **Trigger:** vollautomatisch per Datei-Watcher auf `Scan-Eingang`.
+- **Trigger:** vollautomatisch per Datei-Watcher auf `Scan Eingang`.
 - **Umgebung:** Docker-Container auf dem TrueNAS-Server selbst, neben Nextcloud.
 - **Ordnerstruktur-Abfrage:** live per WebDAV bei jedem Lauf (kein Cache).
 - **Kein Review-Bereich:** direkte Einsortierung + Logdatei pro verarbeiteter Datei
-  `DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt` in `Scan-Eingang/Config/` (siehe
+  `DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt` in `Scan Eingang/Depot Config/` (siehe
   `CONFIG_SUBFOLDER`). Der Watcher ist nicht-rekursiv, sieht diesen Unterordner also
   ohnehin nie als Scan-Eingang; die Namens-basierte Ignorier-Logik bleibt zusätzlich als
   Sicherheitsnetz für Alt-Dateien aus der Zeit vor diesem Unterordner bestehen.
@@ -51,19 +54,29 @@ Fehlzuordnungen manuell in Nextcloud zu korrigieren.
   Log markiert.
 - **Neue Ordner:** werden automatisch nach dem Namensmuster bestehender Ordner angelegt,
   aber im Log besonders hervorgehoben, damit der Nutzer sie kurz gegenprüfen kann.
+- **Einsortierung optional abschaltbar (`FILE_INTO_DOKUMENTE`, Default an):** wenn aus,
+  entfällt der komplette Ordner-Abstieg (spart die Ollama-Aufrufe dafür) — es werden nur
+  Titel/Datum/Absender extrahiert, nichts landet unter `Dokumente/`.
+- **Zusätzliche flache Kopie optional (`SAVE_PROCESSED_COPY`, Default aus):** legt jedes
+  verarbeitete Dokument zusätzlich (oder bei abgeschalteter Einsortierung: ausschließlich)
+  umbenannt+durchsuchbar flach unter `Scan Eingang/Depot Config/Processed/` ab. Mindestens
+  einer der beiden Schalter muss an sein — DEPOT startet sonst gar nicht erst (sähe sich
+  sonst gezwungen, den Scan zu löschen, ohne das Ergebnis irgendwo abgelegt zu haben).
 
 ## Architektur / Datenfluss
 
 ```
-Scan-Eingang (Nextcloud-Datenverzeichnis, read-only Bind-Mount für schnellen Lesezugriff)
+Scan Eingang (Nextcloud-Datenverzeichnis, i.d.R. Dokumente/Scan Eingang, read-only
+              Bind-Mount für schnellen Lesezugriff)
    │
    ▼
 watcher.py (watchdog Observer, on_created/on_moved + Startup-Sweep bei Container-Start)
    │  - ignoriert Dateinamen, die "DEPOT Dateilog" enthalten
    │  - ignoriert nicht-whitelisted Dateiendungen (.pdf .jpg .jpeg .png .tif .tiff)
    │  - Debounce: wartet bis Dateigröße ~2s stabil ist (Scanner schreiben inkrementell)
-   │  - nicht-rekursiv: `Scan-Eingang/Config/` (Logs + `DEPOT Config.json`) wird dadurch
-   │    strukturell nie als Scan-Eingabe betrachtet, ganz ohne Namensfilter
+   │  - nicht-rekursiv: `Scan Eingang/Depot Config/` (Logs, `DEPOT Config.json`,
+   │    `Processed/`, `_Fehlerhaft/`) wird dadurch strukturell nie als Scan-Eingabe
+   │    betrachtet, ganz ohne Namensfilter
    ▼
 pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │
@@ -75,34 +88,49 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    ├─► webdav.py: PROPFIND auf Dokumente/ (Depth:1 rekursiv, da Nextcloud kein
    │           Depth:infinity erlaubt) → flache Liste aller Unterordner, 5 Min. gecacht
    │           (self-erstellte Ordner sofort im Cache ergänzt), gefiltert um
-   │           `excluded_folders` aus DEPOT Config.json
+   │           `excluded_folders` aus DEPOT Config.json UND strukturell IMMER um
+   │           `SCAN_EINGANG_WEBDAV_PATH` selbst (unabhängig von Nutzer-Config) — sonst
+   │           könnte der Klassifikator ein Dokument in/unter den Scan-Eingang zurück-
+   │           einsortieren und der Watcher würde es erneut aufgreifen (Endlosschleife)
    │
-   ├─► classifier.py — zwei getrennte Schritte statt einem Aufruf mit der ganzen
-   │   Ordnerliste auf einmal (Grund: bei einer sehr großen/tiefen Struktur verliert
-   │   ein kleines Modell sonst den Faden und wählt Unsinn — real aufgetreten):
+   ├─► classifier.py — nur wenn FILE_INTO_DOKUMENTE aktiv ist (sonst nur Schritt 1),
+   │   zwei getrennte Schritte statt einem Aufruf mit der ganzen Ordnerliste auf einmal
+   │   (Grund: bei einer sehr großen/tiefen Struktur verliert ein kleines Modell sonst
+   │   den Faden und wählt Unsinn — real aufgetreten):
    │     1. extract_content(): ein Ollama-Aufruf, NUR OCR-Text + Dateiname, ohne
-   │        Ordnerkontext → {title, issue_date, confidence}.
+   │        Ordnerkontext → {title, issue_date, correspondent, confidence}.
    │     2. _walk_folder_tree(): steigt Ebene für Ebene durch Dokumente/ ab. Pro
    │        Ebene ein Ollama-Aufruf mit nur den direkten Unterordnern DIESER Ebene
    │        (plus vollem Dokumenttext erneut) → "descend"/"stay"/"new_folder".
-   │        Ungültige/halluzinierte Wahlen werden gegen die (kleine) Kandidatenliste
-   │        dieser Ebene per Fuzzy-Match korrigiert oder sicher als "stay" behandelt.
+   │        Ungültige/halluzinierte Wahlen (erfundener "descend"-Zielname ohne
+   │        Fuzzy-Match, oder leerer "new_folder"-Name) werden gegen die (kleine)
+   │        Kandidatenliste dieser Ebene korrigiert oder sicher als "stay" behandelt —
+   │        UND die für diesen Schritt gemeldete Konfidenz wird hart auf max. 0.2
+   │        gekappt (der Modellwert selbst ist in diesem Fall nicht vertrauenswürdig;
+   │        vorher konnte ein halluzinierter Schritt mit z.B. 0.95 gemeldeter Konfidenz
+   │        das Dokument fälschlich sicher wirkend eine Ebene zu flach ablegen).
    │        Gesamt-Konfidenz = niedrigste Einzelkonfidenz über Inhalt + alle Schritte.
    │
    ├─► naming.py: Titel sanitizen, Datum validieren, Dateiname
-   │           "YYYY-MM-DD Titel.ext" bauen, Kollisionen auflösen ("(2)", "(3)", …)
+   │           "YYYY-MM-DD [Absender - ]Titel.ext" bauen, Kollisionen auflösen
+   │           ("(2)", "(3)", …)
    │
-   ├─► webdav.py: MKCOL (falls neuer Ordner) + PUT/DELETE (neue durchsuchbare PDF
-   │           hochladen, Original löschen) — alle Schreiboperationen laufen
-   │           ausschließlich über WebDAV, NICHT über den Bind-Mount, damit Nextclouds
-   │           interner File-Cache synchron bleibt (direkte Dateisystem-Schreibzugriffe
-   │           erzeugen sonst unsichtbare "Ghost-Dateien" bis ein manueller
-   │           `occ files:scan` läuft)
+   ├─► webdav.py: MKCOL (falls neuer Ordner) + PUT (neue durchsuchbare PDF hochladen,
+   │           je nach Konfiguration nach Dokumente/... und/oder flach nach
+   │           Scan Eingang/Depot Config/Processed/) + DELETE (Original löschen, NUR
+   │           unter Scan-Eingang-Pfad — der komplette Code hat exakt eine Stelle, die
+   │           webdav.delete() aufruft, und die ist hart auf den Scan-Eingang-Pfad
+   │           fest verdrahtet; nirgendwo im Code wird je ein Ordner gelöscht) — alle
+   │           Schreiboperationen laufen ausschließlich über WebDAV, NICHT über den
+   │           Bind-Mount, damit Nextclouds interner File-Cache synchron bleibt
+   │           (direkte Dateisystem-Schreibzugriffe erzeugen sonst unsichtbare
+   │           "Ghost-Dateien" bis ein manueller `occ files:scan` läuft)
    │
    └─► depotlog.py: eigene Logdatei pro Verarbeitungs-Event unter
-               Scan-Eingang/Config/DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt schreiben,
-               inkl. Sondermarkierung für [OCR-FEHLGESCHLAGEN], [UNSORTIERT] und
-               [NEUER-ORDNER]-Fälle
+               Scan Eingang/Depot Config/DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt
+               schreiben, inkl. Sondermarkierung für [OCR-FEHLGESCHLAGEN],
+               [UNSORTIERT], [NEUER-ORDNER], [PROCESSED-KOPIE] und
+               [EINSORTIERUNG-DEAKTIVIERT]-Fälle
 ```
 
 ## Tech-Stack
@@ -160,6 +188,9 @@ strukturell. Umsetzung:
 
 ```
 DEPOT-Document-Engine-Pipeline-OCR-Tool/
+  .github/
+    workflows/
+      docker-publish.yml  # baut+pusht ghcr.io/.../depot:latest bei Push auf master
   Dockerfile
   docker-compose.yml
   requirements.txt
@@ -184,7 +215,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
     ollama/
       docker-compose.yml  # Ollama-Stack für Dockge auf dem TrueNAS-Server
     depot/
-      docker-compose.yml  # DEPOT-Stack für Dockge (Build-Context = GitHub-URL)
+      docker-compose.yml  # DEPOT-Stack für Dockge (image: ghcr.io/.../depot:latest)
   docs/
     plan.md                  # dieses Dokument
     infrastructure-setup.md  # TrueNAS/Ollama/GPU-Setup-Verlauf und Entscheidungen
@@ -196,7 +227,10 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
 ## Edge Cases
 
 - **Korrupte/unlesbare Datei:** Exception in `ocr.py` abfangen, `[ERROR]` loggen,
-  Fehlversuchszähler erhöhen, nach 3 Versuchen nach `_Fehlerhaft` quarantänisieren.
+  Fehlversuchszähler erhöhen, nach 3 Versuchen nach `Scan Eingang/Depot Config/
+  _Fehlerhaft` quarantänisieren (bewusst NICHT unter `Dokumente/` — das ist DEPOTs eigener
+  Quarantäne-Ordner, kein echtes Dokument, das der Klassifikator je als Ziel angeboten
+  bekommen sollte).
 - **Nicht unterstützter Dateityp:** Endungs-Whitelist, sonst `[SKIPPED-UNSUPPORTED]`
   loggen und unangetastet lassen.
 - **Fast leerer OCR-Text:** erzwungene Konfidenz 0, Fallback nach `Unsortiert`,
@@ -210,8 +244,11 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
   (`AUTO-REDIRECTED`/`AUTO-KORRIGIERT` im Log) statt einen Beinahe-Duplikat-Ordner
   anzulegen oder in `Unsortiert` zu landen.
 - **Strukturell irrelevante Teilbäume** (z.B. ein riesiger Games/Amiibo-Ordner): über
-  `excluded_folders` in der nutzereditierbaren `DEPOT Config.json` (in Scan-Eingang)
-  komplett von der Kandidatenliste ausschließen.
+  `excluded_folders` in der nutzereditierbaren `DEPOT Config.json` (in Scan Eingang/
+  Depot Config) komplett von der Kandidatenliste ausschließen.
+- **Scan-Eingang selbst als potenzielles Klassifikationsziel** (wenn er wie empfohlen
+  unter `Dokumente/` liegt): strukturell und bedingungslos ausgeschlossen, unabhängig von
+  `excluded_folders` — siehe Architektur-Diagramm oben.
 - **Nicht-ASCII-Dateinamen:** NFC-Normalisierung vor jedem Vergleich/WebDAV-Pfad.
 - **Große Batches:** eine `queue.Queue` + feste Worker-Zahl (Default 1), um CPU
   (Tesseract) und LLM (Ollama) auf bescheidener Hardware nicht zu überlasten.

@@ -17,6 +17,8 @@ TAG_DATE_UNCERTAIN = "DATUM-UNSICHER"
 TAG_ERROR = "FEHLER"
 TAG_QUARANTINED = "FEHLER-QUARANTAENE"
 TAG_SKIPPED = "UEBERSPRUNGEN"
+TAG_PROCESSED_COPY = "PROCESSED-KOPIE"
+TAG_FILING_DISABLED = "EINSORTIERUNG-DEAKTIVIERT"
 
 # The log write is a best-effort side channel, not part of the actual filing
 # operation (which has already completed by the time append() is called). A
@@ -48,7 +50,7 @@ class DepotLog:
         webdav: WebDavClient,
         scan_eingang_webdav_path: str,
         prefix: str,
-        config_subfolder: str = "Config",
+        config_subfolder: str = "Depot Config",
     ):
         self._webdav = webdav
         self._folder_path = f"{scan_eingang_webdav_path.strip('/')}/{config_subfolder.strip('/')}"

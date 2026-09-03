@@ -201,6 +201,11 @@ genutzt**, keine weiteren Schritte nötig.
 - Der Eingangsordner heißt beim Nutzer exakt **"Scan Eingang"** (mit Leerzeichen, nicht
   "Scan-Eingang" wie im ursprünglichen Plan als Beispielname verwendet) — wichtig für
   `SCAN_EINGANG_LOCAL_PATH`/`SCAN_EINGANG_WEBDAV_PATH` in der `.env`.
+- **Seit 2026-09-03 empfohlen (siehe Migrationsschritte unten):** `Scan Eingang` liegt
+  INNERHALB von `Dokumente/` (`Dokumente/Scan Eingang`) statt daneben auf oberster Ebene,
+  damit alles ein zusammenhängender Baum ist. DEPOT schließt den Scan-Eingang-Pfad
+  strukturell und bedingungslos von der Klassifikation aus (unabhängig von
+  `excluded_folders`), das ist also gefahrlos.
 
 ## DEPOT-Deployment
 
@@ -242,3 +247,36 @@ GHCR-Package ist es standardmäßig aber nicht).
 **Ablauf für ein Update ab jetzt:** Code committen und nach `master` pushen → GitHub Actions
 baut automatisch (~1-3 Min, Fortschritt unter dem "Actions"-Tab des Repos einsehbar) → in
 Dockge auf den `depot`-Stack den **Update**-Button klicken.
+
+## Migration: Scan Eingang unter Dokumente/, Config-Umbenennung (2026-09-03)
+
+Diese Session hat sowohl Code (Confidence-Cap bei ungültiger Ordnerwahl, Absender-Feld,
+FILE_INTO_DOKUMENTE/SAVE_PROCESSED_COPY-Schalter) als auch die empfohlene Ordnerstruktur
+geändert. Damit das auf dem echten Server ankommt, sind folgende manuellen Schritte nötig
+(kein Skript, da DEPOT selbst keine Nextcloud-Zugangsdaten in dieser Session hat und ein
+automatischer Ordner-Move auf echten Nutzerdaten ohnehin lieber vom Nutzer selbst
+gegengeprüft wird):
+
+1. **In Nextcloud:** den Ordner `Scan Eingang` von der obersten Ebene nach `Dokumente/`
+   verschieben (Web-UI: verschieben/drag&drop, oder ein WebDAV-`MOVE`). Ergebnis:
+   `Dokumente/Scan Eingang`.
+2. Innerhalb dieses Ordners den bisherigen `Config`-Unterordner zu `Depot Config`
+   umbenennen (falls aus einer früheren Session schon vorhanden — enthält `DEPOT
+   Config.json` und die Dateilogs).
+3. Falls noch alte Log-Dateien oder eine alte `DEPOT Config.json` direkt in `Scan Eingang`
+   (nicht im Unterordner) herumliegen: in `Depot Config` verschieben.
+4. Falls bereits Dokumente unter `Dokumente/_Fehlerhaft` quarantänisiert wurden: nach
+   `Dokumente/Scan Eingang/Depot Config/_Fehlerhaft` verschieben (neuer Default-Ort, siehe
+   unten) — optional, alte Fehlerfälle sind vermutlich sowieso längst manuell bereinigt.
+5. **In der `.env` im Dockge-Stack-Verzeichnis** anpassen:
+   ```
+   SCAN_EINGANG_LOCAL_PATH=/nextcloud-data/Dokumente/Scan Eingang
+   SCAN_EINGANG_WEBDAV_PATH=Dokumente/Scan Eingang
+   CONFIG_SUBFOLDER=Depot Config
+   ```
+   `ERROR_FOLDER` NICHT setzen (bzw. die Zeile entfernen, falls vorhanden) — der neue
+   Default `<SCAN_EINGANG_WEBDAV_PATH>/<CONFIG_SUBFOLDER>/_Fehlerhaft` greift dann
+   automatisch. Kein Docker-Compose-/Volume-Änderung nötig: der Bind-Mount deckt bereits
+   den kompletten `files`-Root ab, es ändert sich nur der Unterpfad.
+6. In Dockge: **Update** klicken (holt das neue Image mit den Code-Änderungen UND
+   übernimmt die geänderte `.env` beim Neustart des Containers).

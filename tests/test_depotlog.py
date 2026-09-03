@@ -35,7 +35,7 @@ def test_append_uses_default_config_subfolder(client):
     log = DepotLog(client, "Scan-Eingang", "DEPOT Dateilog")
     log.append("scan1.pdf", "erster Eintrag", on_date=date(2026, 8, 28), on_time=time(9, 0, 0))
 
-    assert client.get("Scan-Eingang/Config/DEPOT Dateilog 28-08-2026 09-00-00.txt") is not None
+    assert client.get("Scan-Eingang/Depot Config/DEPOT Dateilog 28-08-2026 09-00-00.txt") is not None
 
 
 def test_append_creates_a_separate_file_per_event(client):
