@@ -108,11 +108,23 @@ Kennzeichen, Seriennummer, Fahrgestellnummer), nimm diese Kennung mit in \
 den Titel auf - das unterscheidet sonst gleichnamige Dokumente \
 (z.B. "Pruefbericht B-XY 123" statt nur "Pruefbericht"). Das ist KEINE \
 Rechnungs-/Kundennummer und faellt nicht unter das Verbot oben.
-- "issue_date" ist das Ausstellungs-/Rechnungsdatum des Dokuments im Format \
-YYYY-MM-DD, oder null falls nicht ermittelbar. Deutsche Datumsangaben im Text \
-sind TT.MM.JJJJ (Tag zuerst) - wandle sie sorgfaeltig um, ohne Ziffern zu \
-vertauschen. Beispiel: "31.07.2026" im Text bedeutet issue_date "2026-07-31" \
-(Jahr-Monat-Tag), NICHT "3107-07-20" oder aehnliche Vertauschungen.
+- "issue_date" ist das Ausstellungs-/Erstellungsdatum DIESES Dokuments selbst \
+(wann es geschrieben/gedruckt/verschickt wurde) - NICHT irgendein anderes \
+Datum, das im Dokument zufaellig vorkommt. Formulare wie Gehalts-/ \
+Entgeltabrechnungen enthalten oft MEHRERE Datumsangaben, die NICHTS mit dem \
+Ausstellungsdatum zu tun haben: Geburtsdatum, Eintrittsdatum, Austrittsdatum, \
+Referenzdatum u.ae. - diese Personaldaten sind NIEMALS issue_date, auch wenn \
+sie im selben Zeitraum liegen wie das Dokument. Suche stattdessen gezielt \
+nach einem Feld, das woertlich "Datum" heisst (oft in einer Kopfzeile nahe \
+"Seite"/"Kundennummer"/"Kostenstelle") oder dem Datum am Ende/in der \
+Fusszeile des Schreibens. Bist du zwischen mehreren Datumsangaben unsicher, \
+welches das echte Ausstellungsdatum ist, setze issue_date auf null und \
+senke die confidence, statt zu raten oder Ziffern aus verschiedenen Daten \
+zu vermischen. Format YYYY-MM-DD, oder null falls nicht sicher ermittelbar. \
+Deutsche Datumsangaben im Text sind TT.MM.JJJJ (Tag zuerst) - wandle sie \
+sorgfaeltig um, ohne Ziffern zu vertauschen. Beispiel: "31.07.2026" im Text \
+bedeutet issue_date "2026-07-31" (Jahr-Monat-Tag), NICHT "3107-07-20" oder \
+aehnliche Vertauschungen.
 - "confidence" ist deine eigene Einschaetzung (0.0-1.0), wie sicher du bei \
 Titel UND Datum bist. Sei ehrlich niedrig, wenn der Text schlecht lesbar \
 oder mehrdeutig ist.
