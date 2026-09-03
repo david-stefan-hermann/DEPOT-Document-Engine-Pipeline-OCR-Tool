@@ -168,6 +168,80 @@ def test_walk_with_no_top_level_folders_stays_at_root():
     assert tags == []
 
 
+# ---- correspondent-folder-match hint --------------------------------------
+
+EMPLOYER_FOLDERS = [
+    "Dokumente/Arbeit",
+    "Dokumente/Arbeit/Bucher Grundstücksservice",
+    "Dokumente/Arbeit/Bucher Grundstücksservice/Persönlich",
+    "Dokumente/Finanzen",
+    "Dokumente/Finanzen/Vermögen",
+    "Dokumente/Finanzen/Vermögen/Scalable Capital",
+]
+
+
+def test_walk_starts_at_correspondent_matched_folder(monkeypatch):
+    """The real production bug this fixes: with only top-level folder NAMES
+    to go on (no insight into folder contents), the model picked the wrong
+    branch for a payslip from a clearly-named employer. Once the employer
+    name closely matches an EXISTING folder leaf anywhere in the tree, skip
+    straight there instead of gambling on the root-level category guess."""
+    seen_levels = []
+
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+        seen_levels.append(current_path)
+        return _decision("stay", confidence=0.9)
+
+    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
+
+    folder, is_new, confidence, tags = classifier._walk_folder_tree(
+        "Entgeltabrechnung ... Bucher Grundstücksservice GmbH ...",
+        "scan.pdf",
+        EMPLOYER_FOLDERS,
+        "Dokumente",
+        "http://fake",
+        "model",
+        correspondent="Bucher Grundstücksservice GmbH",
+    )
+
+    assert seen_levels == ["Dokumente/Arbeit/Bucher Grundstücksservice"]
+    assert folder == "Dokumente/Arbeit/Bucher Grundstücksservice"
+    assert any("ABSENDER-ORDNER-GEFUNDEN" in t for t in tags)
+
+
+def test_walk_ignores_weak_correspondent_match(monkeypatch):
+    seen_levels = []
+
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+        seen_levels.append(current_path)
+        return _decision("stay", confidence=0.9)
+
+    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
+
+    classifier._walk_folder_tree(
+        "text", "scan.pdf", EMPLOYER_FOLDERS, "Dokumente", "http://fake", "model",
+        correspondent="Voellig Unrelated Absender",
+    )
+
+    assert seen_levels == ["Dokumente"]
+
+
+def test_walk_without_correspondent_starts_at_root(monkeypatch):
+    seen_levels = []
+
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+        seen_levels.append(current_path)
+        return _decision("stay", confidence=0.9)
+
+    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
+
+    classifier._walk_folder_tree(
+        "text", "scan.pdf", EMPLOYER_FOLDERS, "Dokumente", "http://fake", "model", correspondent=""
+    )
+
+    assert seen_levels == ["Dokumente"]
+
+
 # ---- extract_content / _decide_folder_step (real ollama call, mocked) ----
 
 class _FakeClient:
@@ -229,10 +303,13 @@ def test_classify_combines_content_and_folder_walk(monkeypatch):
             title="Arztrechnung", correspondent="Dr. Müller", issue_date=date(2026, 6, 10), confidence=0.8
         ),
     )
-    monkeypatch.setattr(
-        classifier, "_walk_folder_tree",
-        lambda *a, **k: ("Dokumente/Gesundheit/Krankenkasse", False, 0.95, []),
-    )
+    walk_calls = []
+
+    def fake_walk(*a, **k):
+        walk_calls.append(k)
+        return ("Dokumente/Gesundheit/Krankenkasse", False, 0.95, [])
+
+    monkeypatch.setattr(classifier, "_walk_folder_tree", fake_walk)
 
     outcome, tags = classifier.classify(
         ocr_text="text",
@@ -247,3 +324,23 @@ def test_classify_combines_content_and_folder_walk(monkeypatch):
     assert outcome.issue_date == date(2026, 6, 10)
     assert outcome.confidence == 0.8  # min(content=0.8, folder=0.95)
     assert tags == []
+    # the extracted correspondent must be threaded into the folder walk so
+    # it can be used for the correspondent-folder-match hint
+    assert walk_calls[0]["correspondent"] == "Dr. Müller"
+
+
+def test_classify_converts_empty_correspondent_to_none_on_outcome(monkeypatch):
+    monkeypatch.setattr(
+        classifier, "extract_content",
+        lambda *a, **k: ContentExtraction(title="Notiz", correspondent="", confidence=0.5),
+    )
+    monkeypatch.setattr(
+        classifier, "_walk_folder_tree",
+        lambda *a, **k: ("Dokumente", False, 0.5, []),
+    )
+
+    outcome, _ = classifier.classify(
+        ocr_text="text", original_filename="scan.pdf", existing_folders=EXISTING_FOLDERS,
+        ollama_host="http://fake", model="model",
+    )
+    assert outcome.correspondent is None

@@ -35,6 +35,23 @@ MAX_DEPTH = 12
 # landing one level too shallow with a falsely high confidence.
 INVALID_CHOICE_CONFIDENCE_CAP = 0.2
 
+# Above this similarity ratio, an extracted correspondent is treated as
+# already having a home somewhere in the existing tree (e.g. correspondent
+# "Bucher Grundstuecksservice GmbH" vs. an existing folder leaf "Bucher
+# Grundstuecksservice"), and the folder walk starts there directly instead
+# of at the Dokumente root. Slightly higher than NEAR_DUPLICATE_THRESHOLD on
+# purpose: this searches leaf names across the WHOLE tree (not just a
+# handful of siblings at one level), so the larger candidate pool deserves a
+# bit more caution against an accidental false-positive match. Real case
+# this fixes: a small model, given the top-level folder list alone (no
+# insight into what's actually inside each one), confidently but wrongly
+# filed salary slips from a clearly-named employer under Finanzen/Vermoegen/
+# instead of the employer's own existing folder under Arbeit/ - once there,
+# every subsequent level had exactly one child, so "descend" was the only
+# option and each step still reported confidence 1.0, masking how wrong the
+# very first (real, multi-way) choice was.
+CORRESPONDENT_FOLDER_MATCH_THRESHOLD = 0.87
+
 
 class ClassificationOutcome(NamedTuple):
     folder: str
@@ -50,14 +67,17 @@ Du extrahierst Kerninformationen aus einem gescannten Dokument.
 
 Regeln:
 - "correspondent" ist der Absender/Aussteller des Dokuments (Firma, Behoerde, \
-Institution) - kurz und wiedererkennbar, z.B. "Stadtwerke Muenchen" statt \
-"Stadtwerke Muenchen Servicegesellschaft mbH". Steht im Briefkopf/der \
-Absenderzeile z.B. "Finanzamt Muenchen" oder nur "Finanzamt", nutze GENAU \
-das als correspondent (nicht null, nur weil kein Firmenname im Sinne einer \
-GmbH vorliegt - auch Behoerden, Aemter und Kassen sind ein correspondent). \
-Nur bei WIRKLICH keinem erkennbaren Absender (z.B. private Notizen) ist \
-correspondent null. Der Absender darf NICHT nochmal im "title" wiederholt \
-werden.
+Institution) - PFLICHTFELD, darf so gut wie nie leer sein. Kurz und \
+wiedererkennbar, z.B. "Stadtwerke Muenchen" statt "Stadtwerke Muenchen \
+Servicegesellschaft mbH". Suche AKTIV im Briefkopf, in der Absenderzeile \
+oder der Fusszeile nach einem Firmen-/Behoerden-/Kassennamen. Auch Aemter, \
+Kassen und Vereine zaehlen als correspondent, nicht nur Firmen im \
+GmbH-Sinne: steht im Text z.B. "Finanzamt Muenchen" oder nur "Finanzamt", \
+nutze GENAU das. NUR wenn im GESAMTEN Text wirklich kein einziger \
+Absenderhinweis existiert (z.B. eine private handschriftliche Notiz ganz \
+ohne Briefkopf), ist ein leerer String "" erlaubt - das ist der \
+Ausnahmefall, nicht der Normalfall. Der Absender darf NICHT nochmal im \
+"title" wiederholt werden.
 - "title" ist ein kurzer, praegnanter Betreff OHNE den Absendernamen (der \
 steht bereits in "correspondent"), ohne Datum, ohne Dateiendung und ohne \
 Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli" oder "Bussgeldbescheid". \
@@ -210,15 +230,26 @@ def _walk_folder_tree(
     ollama_host: str,
     model: str,
     timeout: float = 120.0,
+    correspondent: str = "",
 ) -> tuple[str, bool, float, list[str]]:
     """Descends the Dokumente/ tree one level at a time, asking the model at
     each level to pick a direction from a small, focused candidate set
     (that level's direct children only) instead of the entire tree at once.
-    Returns (folder, is_new_folder, confidence, tags)."""
+    Returns (folder, is_new_folder, confidence, tags).
+
+    If `correspondent` closely matches an existing folder's leaf name
+    anywhere in the tree, the walk starts there directly instead of at
+    dokumente_root - see CORRESPONDENT_FOLDER_MATCH_THRESHOLD for why."""
     current_path = dokumente_root
     confidences: list[float] = []
     tags: list[str] = []
     is_new_folder = False
+
+    if correspondent:
+        match = closest_existing_leaf(correspondent, existing_folders)
+        if match is not None and match[1] >= CORRESPONDENT_FOLDER_MATCH_THRESHOLD:
+            current_path = match[0]
+            tags.append(f"ABSENDER-ORDNER-GEFUNDEN ({correspondent} -> {match[0]})")
 
     for _ in range(MAX_DEPTH):
         children = _children_of(existing_folders, current_path)
@@ -284,7 +315,8 @@ def classify(
     those as transient and retry/fallback accordingly."""
     content = extract_content(ocr_text, original_filename, ollama_host, model, timeout)
     folder, is_new_folder, folder_confidence, tags = _walk_folder_tree(
-        ocr_text, original_filename, existing_folders, dokumente_root, ollama_host, model, timeout
+        ocr_text, original_filename, existing_folders, dokumente_root, ollama_host, model, timeout,
+        correspondent=content.correspondent,
     )
     overall_confidence = min(content.confidence, folder_confidence)
     outcome = ClassificationOutcome(
@@ -292,7 +324,7 @@ def classify(
         is_new_folder=is_new_folder,
         title=content.title,
         issue_date=content.issue_date,
-        correspondent=content.correspondent,
+        correspondent=content.correspondent or None,
         confidence=overall_confidence,
     )
     return outcome, tags

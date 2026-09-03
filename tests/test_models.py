@@ -10,6 +10,7 @@ def test_content_extraction_parses_and_strips_title():
     result = ContentExtraction.model_validate(
         {
             "title": "  Arztrechnung  ",
+            "correspondent": "Dr. Müller",
             "issue_date": "2026-03-05",
             "confidence": 0.92,
             "reasoning": "Klarer Absender und Betreff.",
@@ -20,49 +21,49 @@ def test_content_extraction_parses_and_strips_title():
 
 
 def test_content_confidence_percentage_int_is_rescaled():
-    result = ContentExtraction.model_validate({"title": "Y", "confidence": 95})
+    result = ContentExtraction.model_validate({"title": "Y", "correspondent": "", "confidence": 95})
     assert result.confidence == 0.95
 
 
 def test_content_confidence_wildly_out_of_range_is_clamped():
-    result = ContentExtraction.model_validate({"title": "Y", "confidence": 500})
+    result = ContentExtraction.model_validate({"title": "Y", "correspondent": "", "confidence": 500})
     assert result.confidence == 1.0
 
 
 def test_content_confidence_negative_is_clamped():
-    result = ContentExtraction.model_validate({"title": "Y", "confidence": -0.2})
+    result = ContentExtraction.model_validate({"title": "Y", "correspondent": "", "confidence": -0.2})
     assert result.confidence == 0.0
 
 
 def test_content_missing_issue_date_is_none():
-    result = ContentExtraction.model_validate({"title": "Unklares Dokument", "confidence": 0.1})
+    result = ContentExtraction.model_validate({"title": "Unklares Dokument", "correspondent": "", "confidence": 0.1})
     assert result.issue_date is None
 
 
 def test_content_implausible_future_date_is_discarded():
     result = ContentExtraction.model_validate(
-        {"title": "Zuzahlungsrechnung", "issue_date": "3107-07-20", "confidence": 0.8}
+        {"title": "Zuzahlungsrechnung", "correspondent": "", "issue_date": "3107-07-20", "confidence": 0.8}
     )
     assert result.issue_date is None
 
 
 def test_content_implausible_ancient_date_is_discarded():
     result = ContentExtraction.model_validate(
-        {"title": "Rechnung", "issue_date": "1850-01-01", "confidence": 0.8}
+        {"title": "Rechnung", "correspondent": "", "issue_date": "1850-01-01", "confidence": 0.8}
     )
     assert result.issue_date is None
 
 
 def test_content_plausible_old_date_is_kept():
     result = ContentExtraction.model_validate(
-        {"title": "Rechnung", "issue_date": "1998-05-01", "confidence": 0.8}
+        {"title": "Rechnung", "correspondent": "", "issue_date": "1998-05-01", "confidence": 0.8}
     )
     assert result.issue_date.isoformat() == "1998-05-01"
 
 
 def test_content_empty_title_rejected():
     with pytest.raises(ValidationError):
-        ContentExtraction.model_validate({"title": "", "confidence": 0.5})
+        ContentExtraction.model_validate({"title": "", "correspondent": "", "confidence": 0.5})
 
 
 def test_content_correspondent_is_stripped():
@@ -72,14 +73,14 @@ def test_content_correspondent_is_stripped():
     assert result.correspondent == "Stadtwerke München"
 
 
-def test_content_correspondent_defaults_to_none():
-    result = ContentExtraction.model_validate({"title": "Notiz", "confidence": 0.5})
-    assert result.correspondent is None
+def test_content_correspondent_is_required():
+    with pytest.raises(ValidationError):
+        ContentExtraction.model_validate({"title": "Notiz", "confidence": 0.5})
 
 
-def test_content_blank_correspondent_becomes_none():
+def test_content_blank_correspondent_becomes_empty_string():
     result = ContentExtraction.model_validate({"title": "Notiz", "correspondent": "   ", "confidence": 0.5})
-    assert result.correspondent is None
+    assert result.correspondent == ""
 
 
 # ---- FolderStepDecision ----------------------------------------------------

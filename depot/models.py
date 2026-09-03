@@ -30,7 +30,13 @@ class ContentExtraction(BaseModel):
     title, issue date and correspondent, extracted from OCR text alone."""
 
     title: str = Field(min_length=1)
-    correspondent: str | None = None
+    # Deliberately REQUIRED (no default), not Optional: a live test against
+    # the real model showed it reliably returns null/omits this field when
+    # it's merely optional in the JSON schema, even with an explicit prompt
+    # instruction saying otherwise - but reliably fills it in correctly once
+    # the schema itself marks it required. Empty string ("") is still a
+    # legitimate value, meaning "genuinely no sender found".
+    correspondent: str
     issue_date: date | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ""
@@ -47,11 +53,8 @@ class ContentExtraction(BaseModel):
 
     @field_validator("correspondent")
     @classmethod
-    def _strip_correspondent(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
-        v = v.strip()
-        return v or None
+    def _strip_correspondent(cls, v: str) -> str:
+        return v.strip()
 
     @field_validator("issue_date")
     @classmethod

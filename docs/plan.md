@@ -92,9 +92,13 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │           Depth:infinity erlaubt) → flache Liste aller Unterordner, 5 Min. gecacht
    │           (self-erstellte Ordner sofort im Cache ergänzt), gefiltert um
    │           `excluded_folders` aus DEPOT Config.json UND strukturell IMMER um
-   │           `SCAN_EINGANG_WEBDAV_PATH` selbst (unabhängig von Nutzer-Config) — sonst
-   │           könnte der Klassifikator ein Dokument in/unter den Scan-Eingang zurück-
-   │           einsortieren und der Watcher würde es erneut aufgreifen (Endlosschleife)
+   │           `SCAN_EINGANG_WEBDAV_PATH` (sonst könnte der Klassifikator ein Dokument
+   │           in/unter den Scan-Eingang zurück-einsortieren, Endlosschleife mit dem
+   │           Watcher) UND `FALLBACK_FOLDER`/Unsortiert (das ist die Konfidenz-
+   │           Notbremse, kein normales Klassifikationsziel — real aufgetreten: das
+   │           Modell wählte Unsortiert selbst, mit 0.95 gemeldeter Konfidenz und ganz
+   │           ohne Tag, was die Funktion als sichtbares "muss geprüft werden"-Fach
+   │           unterlief)
    │
    ├─► classifier.py — nur wenn file_into_dokumente aktiv ist (sonst nur Schritt 1),
    │   zwei getrennte Schritte statt einem Aufruf mit der ganzen Ordnerliste auf einmal
@@ -102,17 +106,41 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │   den Faden und wählt Unsinn — real aufgetreten):
    │     1. extract_content(): ein Ollama-Aufruf, NUR OCR-Text + Dateiname, ohne
    │        Ordnerkontext → {title, issue_date, correspondent, confidence}.
+   │        `correspondent` ist PFLICHTFELD im JSON-Schema (nicht optional) — ein
+   │        Live-Test zeigte, dass das kleine Modell ein optionales Feld praktisch immer
+   │        mit null beantwortet, selbst mit expliziter Prompt-Anweisung, ein PFLICHT-
+   │        Feld aber zuverlässig befüllt. Leerstring "" bleibt als "wirklich kein
+   │        Absender erkennbar" gültig.
    │     2. _walk_folder_tree(): steigt Ebene für Ebene durch Dokumente/ ab. Pro
    │        Ebene ein Ollama-Aufruf mit nur den direkten Unterordnern DIESER Ebene
    │        (plus vollem Dokumenttext erneut) → "descend"/"stay"/"new_folder".
-   │        Ungültige/halluzinierte Wahlen (erfundener "descend"-Zielname ohne
-   │        Fuzzy-Match, oder leerer "new_folder"-Name) werden gegen die (kleine)
-   │        Kandidatenliste dieser Ebene korrigiert oder sicher als "stay" behandelt —
-   │        UND die für diesen Schritt gemeldete Konfidenz wird hart auf max. 0.2
-   │        gekappt (der Modellwert selbst ist in diesem Fall nicht vertrauenswürdig;
-   │        vorher konnte ein halluzinierter Schritt mit z.B. 0.95 gemeldeter Konfidenz
-   │        das Dokument fälschlich sicher wirkend eine Ebene zu flach ablegen).
-   │        Gesamt-Konfidenz = niedrigste Einzelkonfidenz über Inhalt + alle Schritte.
+   │        Startet NICHT zwingend bei Dokumente/: matcht `correspondent` zuerst per
+   │        Fuzzy-Vergleich (`closest_existing_leaf`, Schwelle 0.87) gegen JEDEN
+   │        Ordner-Leaf-Namen im GESAMTEN Baum — bei einem Treffer beginnt der Abstieg
+   │        direkt dort. Grund (real aufgetreten): ohne diesen Hinweis sieht das Modell
+   │        auf der Wurzelebene nur 15 Ordnernamen ohne jeden Einblick, was darin
+   │        eigentlich liegt, und wählte für eine Gehaltsabrechnung von "Bucher
+   │        Grundstücksservice GmbH" die komplett falsche Kategorie "Finanzen" statt
+   │        "Arbeit/Bucher Grundstücksservice" (der Ordner existierte bereits exakt so).
+   │        Ab der falschen Wurzel-Wahl hatte jede weitere Ebene nur noch genau EINEN
+   │        Unterordner zur Auswahl — "descend" war die einzig mögliche Antwort, und das
+   │        Modell meldete an jeder dieser trivialen Ein-Optionen-Stufen konsequent
+   │        Konfidenz 1.0, was die eine echte (falsche) Entscheidung ganz oben im Baum
+   │        völlig verschleierte. Ungültige/halluzinierte Wahlen (erfundener
+   │        "descend"-Zielname ohne Fuzzy-Match, oder leerer "new_folder"-Name) werden
+   │        gegen die (kleine) Kandidatenliste dieser Ebene korrigiert oder sicher als
+   │        "stay" behandelt — UND die für diesen Schritt gemeldete Konfidenz wird hart
+   │        auf max. 0.2 gekappt (der Modellwert selbst ist in diesem Fall nicht
+   │        vertrauenswürdig; vorher konnte ein halluzinierter Schritt mit z.B. 0.95
+   │        gemeldeter Konfidenz das Dokument fälschlich sicher wirkend eine Ebene zu
+   │        flach ablegen). Gesamt-Konfidenz = niedrigste Einzelkonfidenz über Inhalt +
+   │        alle Schritte.
+   │        **Bekannte, noch offene Grenze:** hat der Absender KEINE Entsprechung
+   │        irgendwo im Baum (z.B. ein Finanzamt-Schreiben ohne existierenden
+   │        "Finanzamt"-Ordner), greift der Fuzzy-Hint nicht und das Modell bleibt bei
+   │        der ungelösten Wurzel-Entscheidung mit dem oben beschriebenen
+   │        Ein-Optionen-Kaskaden-Problem — reale Fehlklassifikation, per Live-Test
+   │        gegen die echte Ordnerstruktur bestätigt, noch nicht behoben.
    │
    ├─► naming.py: Titel sanitizen, Datum validieren, Dateiname
    │           "YYYY-MM-DD [Absender - ]Titel.ext" bauen, Kollisionen auflösen
@@ -180,12 +208,20 @@ drittes, striktes `document_type`-Enum-Feld (wie bei paperless-ngx) wurde bewuss
 übernommen: DEPOT hat keine Metadaten-Datenbank/Such-UI, die davon profitieren würde – die
 vorhandene, handgepflegte Ordnerstruktur übernimmt diese Kategorisierung bereits
 strukturell. Umsetzung:
-- `classifier.py`/`models.py`: `ContentExtraction.correspondent` (optional, `None` wenn
-  kein klarer Absender erkennbar), per Prompt-Regel explizit NICHT mehr redundant im
-  `title` enthalten.
+- `classifier.py`/`models.py`: `ContentExtraction.correspondent` ist ein PFLICHTFELD im
+  JSON-Schema (Leerstring "" statt `None` bedeutet "kein Absender erkennbar" — siehe
+  Architektur-Diagramm oben für den Live-Test, der zeigte, dass genau das nötig war, um
+  das kleine Modell zuverlässig zur Extraktion zu bewegen), per Prompt-Regel explizit
+  NICHT mehr redundant im `title` enthalten. Auf `ClassificationOutcome` bleibt es
+  weiterhin `str | None` (Leerstring wird dort zu `None` normalisiert).
 - `naming.py`: `build_filename(..., correspondent=...)` stellt `"{Absender} - "` voran,
   wenn vorhanden; `MAX_FILENAME_LENGTH` (150 Zeichen) kappt das Ergebnis hart, als
   Sicherheitsnetz gegen ausufernde OCR-Titel bei tief verschachtelten Nextcloud-Pfaden.
+- `classifier.py`: der extrahierte Absender wird zusätzlich per Fuzzy-Match gegen
+  existierende Ordner-Leaf-Namen im GESAMTEN Baum abgeglichen (`
+  CORRESPONDENT_FOLDER_MATCH_THRESHOLD = 0.87`) und bestimmt bei einem Treffer den
+  Startpunkt des Ordner-Abstiegs — siehe Architektur-Diagramm oben für den realen Fall,
+  den das behebt, und die noch offene Grenze (kein Treffer = ungelöst).
 
 ## Repo-Struktur
 
@@ -274,7 +310,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (100 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (118 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

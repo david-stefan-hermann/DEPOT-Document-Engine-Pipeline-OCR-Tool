@@ -176,13 +176,43 @@ genutzt**, keine weiteren Schritte nötig.
   0.80 bei völlig unterschiedlichen Dokumenten — sieht nach einer Art
   Ausweich-/Standardantwort aus, wenn das Modell mit dem deutschsprachigen
   Mehrschritt-Prompt nicht klarkommt. **Wieder auf Qwen2.5 zurückgewechselt.**
-- **Offener Punkt für die nächste Session:** Klassifikationsqualität mit Qwen2.5 ist
-  laut Nutzer-Feedback "relativ schlecht" — funktioniert prinzipiell (siehe oben), aber
-  noch nicht zufriedenstellend zuverlässig. Mögliche nächste Schritte, noch nicht
-  entschieden: anderes Modell in der ~6GB-Klasse ausprobieren (z.B. Gemma 2 9B, laut
-  Recherche mit nur 5.7GB VRAM konkurrenzfähig zu 13B-Modellen), Prompt weiter schärfen,
-  oder mit mehr echten Beispieldokumenten systematisch nachtesten statt Einzelfälle zu
-  jagen.
+- **Root-Cause-Analyse der schlechten Klassifikationsqualität (2026-09-03):** anhand
+  echter Fehlklassifikationen aus den Produktions-Logs (drei Dokumente landeten
+  fälschlich alle im selben Ordner `Finanzen/Vermögen/Scalable Capital/2026`) per
+  Live-Repro-Skript gegen das echte Ollama + die echte Ordnerstruktur direkt
+  reproduziert (nicht nur vermutet). Zwei konkrete Ursachen gefunden und behoben (siehe
+  `docs/plan.md`, Architektur-Diagramm):
+  1. `correspondent` kam bei klar erkennbarem Absender im Text (z.B. "Bucher
+     Grundstücksservice GmbH" direkt im Briefkopf) trotz Prompt-Anweisung als `null`
+     zurück. Ein isolierter Test bestätigte: als PFLICHTFELD im JSON-Schema (statt
+     optional) extrahiert Qwen2.5 denselben Text zuverlässig korrekt. Grund vermutlich:
+     ein optionales Feld im strukturierten Output ist für ein kleines Modell einfacher
+     wegzulassen als zu befüllen, unabhängig von der Prompt-Anweisung.
+  2. Die Wurzelebene (15 Top-Level-Ordner, reine Namensliste ohne jeden Einblick in den
+     Ordnerinhalt) wählte für eine Gehaltsabrechnung "Finanzen" statt "Arbeit" —
+     inhaltlich nicht absurd, aber falsch gegenüber der tatsächlichen
+     Ablage-Konvention des Nutzers. Ab dort hatte jede weitere Ebene nur noch EINEN
+     Unterordner zur Auswahl, sodass der komplette restliche Abstieg praktisch
+     erzwungen war, aber trotzdem an jeder trivialen Stufe Konfidenz 1.0 meldete —
+     die eine echte (falsche) Entscheidung ganz oben blieb dadurch unsichtbar.
+     Fix: der extrahierte Absender wird jetzt zusätzlich per Fuzzy-Match gegen JEDEN
+     Ordnernamen im gesamten Baum abgeglichen; bei einer Übereinstimmung (Schwelle 0.87)
+     startet der Abstieg direkt dort statt an der Wurzel. Live verifiziert: die
+     Gehaltsabrechnung landet jetzt korrekt unter `Arbeit/Bucher Grundstücksservice`
+     statt `Finanzen/Vermögen/Scalable Capital`.
+  3. Zusätzlich, unabhängig gefunden: `Unsortiert` war für den Klassifikator ein ganz
+     normal wählbarer Ordner (kein struktureller Ausschluss) — das Modell wählte es in
+     einem Fall selbst mit 0.95 Konfidenz, was den Zweck als sichtbares "muss geprüft
+     werden"-Fach unterlief. Jetzt strukturell ausgeschlossen wie der Scan-Eingang-Pfad.
+  - **Weiterhin offen (real reproduziert, noch ungelöst):** hat der Absender KEINE
+    Entsprechung irgendwo im vorhandenen Baum (z.B. ein Finanzamt-Schreiben ohne
+    existierenden "Finanzamt"-Ordner), greift der neue Fuzzy-Hint nicht, und die
+    Wurzelebene bleibt die ungelöste Schwachstelle — dieses Dokument landete im
+    Live-Test weiterhin fälschlich unter `Finanzen/Vermögen/Scalable Capital`.
+    Mögliche nächste Schritte, noch nicht entschieden: anderes Modell in der
+    ~6GB-Klasse ausprobieren (z.B. Gemma 2 9B), dem Modell mehr Kontext pro Kandidat
+    geben (z.B. ein paar Beispiel-Dateinamen aus jedem Kandidatenordner statt nur den
+    Namen), oder mit mehr echten Beispieldokumenten systematisch nachtesten.
 
 ## Nextcloud
 

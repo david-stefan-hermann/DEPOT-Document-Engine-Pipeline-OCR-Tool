@@ -73,14 +73,22 @@ class Pipeline:
                     self.config.config_subfolder,
                     self.config.config_file_name,
                 )
-                # Structural, non-optional exclusion (on top of whatever the
-                # user configured): the scan inbox itself must never be
-                # offered as a filing target. This matters most when
-                # Scan-Eingang lives inside Dokumente/ - without this, the
-                # classifier could file a document straight back into (or
-                # under) the folder the watcher watches, which would pick it
-                # up again and reprocess it in a loop.
-                excluded = [*excluded, self.config.scan_eingang_webdav_path]
+                # Structural, non-optional exclusions (on top of whatever the
+                # user configured):
+                # - the scan inbox itself must never be offered as a filing
+                #   target. This matters most when Scan-Eingang lives inside
+                #   Dokumente/ - without this, the classifier could file a
+                #   document straight back into (or under) the folder the
+                #   watcher watches, which would pick it up again and
+                #   reprocess it in a loop.
+                # - the low-confidence fallback folder must never be a
+                #   candidate the model can deliberately choose - it's meant
+                #   to be reached only via the confidence-threshold check
+                #   below, as a visible "needs review" signal. Seen in
+                #   production: the model happily filing a document there on
+                #   its own with confidence 0.95 and no tags, silently
+                #   defeating the point of a review bucket.
+                excluded = [*excluded, self.config.scan_eingang_webdav_path, self.config.fallback_folder]
                 self._folder_cache = scan_config.filter_excluded(folders, excluded)
                 self._folder_cache_time = now
             return list(self._folder_cache)

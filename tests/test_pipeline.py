@@ -381,6 +381,20 @@ def test_scan_eingang_is_always_excluded_even_when_nested_under_dokumente(tmp_pa
     p.state.close()
 
 
+def test_fallback_folder_is_never_offered_as_classification_target(pipeline, client):
+    """Seen in production: the model choosing Unsortiert deliberately (high
+    confidence, no tags) instead of it being reached only via the
+    confidence-threshold fallback - defeats its purpose as a "needs review"
+    bucket. fallback_folder must be structurally excluded, like Scan-Eingang."""
+    client.mkcol("Dokumente/Unsortiert")
+    client.mkcol("Dokumente/Gesundheit")
+
+    folders = pipeline._get_existing_folders()
+
+    assert "Dokumente/Gesundheit" in folders
+    assert "Dokumente/Unsortiert" not in folders
+
+
 # ---- file_into_dokumente / save_processed_copy switches (DEPOT Config.json) ---
 
 def _write_processing_switches(tmp_path, config_subfolder="Config", **switches):
@@ -478,7 +492,7 @@ def test_switch_takes_effect_on_next_document_without_restart(monkeypatch, tmp_p
     )
     monkeypatch.setattr(
         classifier, "extract_content",
-        lambda *a, **k: ContentExtraction(title="Doc", confidence=0.9),
+        lambda *a, **k: ContentExtraction(title="Doc", correspondent="", confidence=0.9),
     )
 
     p.process_one(scan1)  # no DEPOT Config.json yet -> default: filing on
