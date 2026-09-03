@@ -88,6 +88,37 @@ class FolderStepDecision(BaseModel):
         return v.strip().strip("/") if v else None
 
 
+class AnthropicFolderDecision(BaseModel):
+    """A single-shot filing decision from the cloud (Anthropic) classifier,
+    given the whole existing folder tree at once rather than one level at a
+    time - a strong model doesn't need the small-model-oriented hierarchical
+    walk that FolderStepDecision/_walk_folder_tree exists for."""
+
+    action: Literal["existing", "new_folder"]
+    # For "existing": must be one of the offered existing folder paths
+    # exactly. For "new_folder": the EXISTING parent path the new folder
+    # should be created under (new_folder_name holds the new leaf name).
+    folder: str = Field(min_length=1)
+    new_folder_name: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+    reasoning: str = ""
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: float | int) -> float:
+        return _normalize_confidence_value(v)
+
+    @field_validator("folder")
+    @classmethod
+    def _strip_folder(cls, v: str) -> str:
+        return v.strip().strip("/")
+
+    @field_validator("new_folder_name")
+    @classmethod
+    def _strip_new_folder_name(cls, v: str | None) -> str | None:
+        return v.strip().strip("/") if v else None
+
+
 class OcrResult(BaseModel):
     """Result of running OCR on one input file."""
 

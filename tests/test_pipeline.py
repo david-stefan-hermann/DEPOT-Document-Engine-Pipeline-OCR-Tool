@@ -29,6 +29,8 @@ def make_config(tmp_path, **overrides) -> Config:
         ollama_host="http://fake:11434",
         ollama_model="fake-model",
         confidence_threshold=0.6,
+        anthropic_api_key=None,
+        anthropic_model="claude-haiku-4-5",
         log_file_prefix="DEPOT Dateilog",
         config_file_name="DEPOT Config.json",
         config_subfolder="Config",
@@ -504,4 +506,45 @@ def test_switch_takes_effect_on_next_document_without_restart(monkeypatch, tmp_p
     processed = [f for f in fake_server.files if f.startswith("Scan-Eingang/Config/Processed/")]
     assert len(filed) == 1  # only scan1
     assert len(processed) == 1  # only scan2
+
+
+def test_use_anthropic_classifier_switch_routes_to_cloud_folder_decision(monkeypatch, tmp_path, fake_server, client):
+    """When the switch is on, the pipeline must call classify_via_anthropic
+    (cloud folder decision) instead of classify (local walk) - not both."""
+    _write_processing_switches(tmp_path, use_anthropic_classifier=True)
+    p = _make_pipeline(tmp_path, client, anthropic_api_key="sk-ant-fake")
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(p, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+
+    def _classify_should_not_be_called(**kwargs):
+        raise AssertionError("classify (local walk) must not be called when use_anthropic_classifier is on")
+
+    monkeypatch.setattr(classifier, "classify", _classify_should_not_be_called)
+
+    via_anthropic_calls = []
+
+    def fake_classify_via_anthropic(**kwargs):
+        via_anthropic_calls.append(kwargs)
+        return (
+            ClassificationOutcome(
+                folder="Dokumente/Gesundheit", is_new_folder=False, title="Rezept", confidence=0.9
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(classifier, "classify_via_anthropic", fake_classify_via_anthropic)
+
+    p.process_one(scan)
+
+    assert len(via_anthropic_calls) == 1
+    assert via_anthropic_calls[0]["anthropic_api_key"] == "sk-ant-fake"
+    filed = [f for f in fake_server.files if f.startswith("Dokumente/Gesundheit/")]
+    assert len(filed) == 1
+    p.state.close()
     p.state.close()

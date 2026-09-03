@@ -32,6 +32,12 @@ class Config:
     ollama_model: str
     confidence_threshold: float
 
+    # Optional cloud-classification fallback (opt-in via `use_anthropic_classifier`
+    # in DEPOT Config.json). None if unset - only the folder-routing decision
+    # would ever use this, never OCR content; see classifier.classify_via_anthropic.
+    anthropic_api_key: str | None
+    anthropic_model: str
+
     log_file_prefix: str
     config_file_name: str
     config_subfolder: str
@@ -76,6 +82,8 @@ class Config:
             ollama_host=os.environ.get("OLLAMA_HOST", "http://localhost:11434"),
             ollama_model=os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M"),
             confidence_threshold=float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6")),
+            anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
+            anthropic_model=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5"),
             log_file_prefix=os.environ.get("LOG_FILE_PREFIX", "DEPOT Dateilog"),
             config_file_name=os.environ.get("CONFIG_FILE_NAME", "DEPOT Config.json"),
             config_subfolder=config_subfolder,

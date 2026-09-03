@@ -58,17 +58,18 @@ def filter_excluded(folders: list[str], excluded_prefixes: list[str]) -> list[st
 
 def load_processing_switches(
     scan_eingang_local_path: str, config_subfolder: str, config_file_name: str
-) -> tuple[bool, bool]:
-    """Reads `file_into_dokumente`/`save_processed_copy` from DEPOT
-    Config.json, e.g.:
-        { "file_into_dokumente": true, "save_processed_copy": false }
+) -> tuple[bool, bool, bool]:
+    """Reads `file_into_dokumente`/`save_processed_copy`/`use_anthropic_classifier`
+    from DEPOT Config.json, e.g.:
+        { "file_into_dokumente": true, "save_processed_copy": false, "use_anthropic_classifier": false }
     Read fresh on every call (a cheap local file read) rather than cached,
     so toggling a switch in the file takes effect on the very next document
     instead of waiting on the folder-listing cache TTL. Missing file/keys
-    default to (True, False) - the original fixed behavior. If both would
-    end up False, DEPOT would have nowhere to put a processed document
-    before deleting the source scan - file_into_dokumente wins instead,
-    with a warning, rather than ever silently discarding one."""
+    default to (True, False, False) - the original fixed behavior. If
+    file_into_dokumente and save_processed_copy would both end up False,
+    DEPOT would have nowhere to put a processed document before deleting
+    the source scan - file_into_dokumente wins instead, with a warning,
+    rather than ever silently discarding one."""
     data = _load_json(scan_eingang_local_path, config_subfolder, config_file_name)
 
     file_into_dokumente = data.get("file_into_dokumente", True)
@@ -81,6 +82,13 @@ def load_processing_switches(
         log.warning("%s: 'save_processed_copy' must be true/false; using default false.", config_file_name)
         save_processed_copy = False
 
+    use_anthropic_classifier = data.get("use_anthropic_classifier", False)
+    if not isinstance(use_anthropic_classifier, bool):
+        log.warning(
+            "%s: 'use_anthropic_classifier' must be true/false; using default false.", config_file_name
+        )
+        use_anthropic_classifier = False
+
     if not file_into_dokumente and not save_processed_copy:
         log.warning(
             "%s: both file_into_dokumente and save_processed_copy are false; "
@@ -89,4 +97,4 @@ def load_processing_switches(
         )
         file_into_dokumente = True
 
-    return file_into_dokumente, save_processed_copy
+    return file_into_dokumente, save_processed_copy, use_anthropic_classifier

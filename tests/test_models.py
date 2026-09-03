@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from depot.models import ContentExtraction, FolderStepDecision
+from depot.models import AnthropicFolderDecision, ContentExtraction, FolderStepDecision
 
 
 # ---- ContentExtraction ----------------------------------------------------
@@ -107,3 +107,43 @@ def test_folder_step_decision_invalid_action_rejected():
 def test_folder_step_decision_confidence_percentage_is_rescaled():
     result = FolderStepDecision.model_validate({"action": "stay", "confidence": 80})
     assert result.confidence == 0.8
+
+
+# ---- AnthropicFolderDecision -----------------------------------------------
+
+def test_anthropic_folder_decision_existing_action():
+    result = AnthropicFolderDecision.model_validate(
+        {"action": "existing", "folder": "  Dokumente/Gesundheit  ", "confidence": 0.9}
+    )
+    assert result.action == "existing"
+    assert result.folder == "Dokumente/Gesundheit"
+    assert result.new_folder_name is None
+
+
+def test_anthropic_folder_decision_new_folder_action():
+    result = AnthropicFolderDecision.model_validate(
+        {
+            "action": "new_folder",
+            "folder": "Dokumente/Gesundheit",
+            "new_folder_name": "  Zahnarzt  ",
+            "confidence": 0.85,
+        }
+    )
+    assert result.new_folder_name == "Zahnarzt"
+
+
+def test_anthropic_folder_decision_invalid_action_rejected():
+    with pytest.raises(ValidationError):
+        AnthropicFolderDecision.model_validate({"action": "explode", "folder": "Dokumente", "confidence": 0.5})
+
+
+def test_anthropic_folder_decision_empty_folder_rejected():
+    with pytest.raises(ValidationError):
+        AnthropicFolderDecision.model_validate({"action": "existing", "folder": "", "confidence": 0.5})
+
+
+def test_anthropic_folder_decision_confidence_percentage_is_rescaled():
+    result = AnthropicFolderDecision.model_validate(
+        {"action": "existing", "folder": "Dokumente", "confidence": 85}
+    )
+    assert result.confidence == 0.85

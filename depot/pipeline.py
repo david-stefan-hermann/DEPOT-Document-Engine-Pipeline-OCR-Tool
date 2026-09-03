@@ -225,8 +225,10 @@ class Pipeline:
         # startup, so the user can toggle these directly in DEPOT
         # Config.json in Nextcloud and have it take effect on the very next
         # scan, the same way excluded_folders already works.
-        file_into_dokumente, save_processed_copy = scan_config.load_processing_switches(
-            cfg.scan_eingang_local_path, cfg.config_subfolder, cfg.config_file_name
+        file_into_dokumente, save_processed_copy, use_anthropic_classifier = (
+            scan_config.load_processing_switches(
+                cfg.scan_eingang_local_path, cfg.config_subfolder, cfg.config_file_name
+            )
         )
 
         ocr_result = ocr.process_file(path, cfg.ocr_language)
@@ -248,14 +250,26 @@ class Pipeline:
                 tags.append(depotlog.TAG_UNSORTED)
         elif file_into_dokumente:
             existing_folders = self._get_existing_folders()
-            result, classifier_tags = classifier.classify(
-                ocr_text=ocr_result.text,
-                original_filename=original_name,
-                existing_folders=existing_folders,
-                ollama_host=cfg.ollama_host,
-                model=cfg.ollama_model,
-                dokumente_root=cfg.dokumente_webdav_root,
-            )
+            if use_anthropic_classifier:
+                result, classifier_tags = classifier.classify_via_anthropic(
+                    ocr_text=ocr_result.text,
+                    original_filename=original_name,
+                    existing_folders=existing_folders,
+                    ollama_host=cfg.ollama_host,
+                    model=cfg.ollama_model,
+                    anthropic_api_key=cfg.anthropic_api_key,
+                    anthropic_model=cfg.anthropic_model,
+                    dokumente_root=cfg.dokumente_webdav_root,
+                )
+            else:
+                result, classifier_tags = classifier.classify(
+                    ocr_text=ocr_result.text,
+                    original_filename=original_name,
+                    existing_folders=existing_folders,
+                    ollama_host=cfg.ollama_host,
+                    model=cfg.ollama_model,
+                    dokumente_root=cfg.dokumente_webdav_root,
+                )
             tags += classifier_tags
             confidence = result.confidence
             title = result.title

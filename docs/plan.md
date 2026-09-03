@@ -65,6 +65,17 @@ Fehlzuordnungen manuell in Nextcloud zu korrigieren.
   abgelegt zu haben. Bewusst genau wie `excluded_folders` direkt in `DEPOT Config.json`
   steuerbar (nicht per Env-Var): wird bei jeder Datei frisch neu gelesen, eine Änderung in
   Nextcloud wirkt also sofort auf die nächste Datei, ohne Container-Neustart.
+- **Cloud-Fallback für die Ordner-Entscheidung optional (`use_anthropic_classifier` in
+  `DEPOT Config.json`, Default aus):** delegiert NUR die Ordner-Wahl an Anthropic (Claude),
+  Titel/Datum/Absender-Extraktion bleibt immer lokal über Ollama. An Anthropic gehen
+  ausschließlich `correspondent` + `title` + die vollständige Ordnerpfad-Liste — NIEMALS
+  der OCR-Text oder Dateiname. Grund: die lokalen ~7-9B-Modelle scheitern nachweislich
+  genau dort, wo für eine sinnvolle Kategorie-Entscheidung Weltwissen/Urteilsvermögen ohne
+  Einblick in Ordnerinhalte nötig ist (siehe Architektur-Diagramm unten,
+  `CORRESPONDENT_FOLDER_MATCH_THRESHOLD`-Grenze). Ist `ANTHROPIC_API_KEY` nicht gesetzt
+  oder schlägt der Aufruf fehl, landet das Dokument (mit dem bereits lokal ermittelten
+  Titel) direkt in `FALLBACK_FOLDER` — kein Fallback auf den lokalen Ordner-Abstieg, kein
+  Retry der ganzen Pipeline.
 
 ## Architektur / Datenfluss
 
@@ -135,12 +146,17 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │        gemeldeter Konfidenz das Dokument fälschlich sicher wirkend eine Ebene zu
    │        flach ablegen). Gesamt-Konfidenz = niedrigste Einzelkonfidenz über Inhalt +
    │        alle Schritte.
-   │        **Bekannte, noch offene Grenze:** hat der Absender KEINE Entsprechung
-   │        irgendwo im Baum (z.B. ein Finanzamt-Schreiben ohne existierenden
-   │        "Finanzamt"-Ordner), greift der Fuzzy-Hint nicht und das Modell bleibt bei
-   │        der ungelösten Wurzel-Entscheidung mit dem oben beschriebenen
-   │        Ein-Optionen-Kaskaden-Problem — reale Fehlklassifikation, per Live-Test
-   │        gegen die echte Ordnerstruktur bestätigt, noch nicht behoben.
+   │        **Bekannte Grenze, wenn KEIN Absender-Ordner-Match existiert** (z.B. ein
+   │        Finanzamt-Schreiben ohne existierenden "Finanzamt"-Ordner): greift der
+   │        Fuzzy-Hint nicht, und das lokale Modell (egal ob Qwen2.5 oder Gemma2 9B,
+   │        beide per Live-Test bestätigt) bleibt bei der ungelösten Wurzel-Entscheidung
+   │        mit dem oben beschriebenen Ein-Optionen-Kaskaden-Problem — reale
+   │        Fehlklassifikation, live gegen die echte Ordnerstruktur bestätigt. Genau für
+   │        DIESEN Fall existiert `use_anthropic_classifier` (s.o.): live verifiziert,
+   │        dass Claude Haiku 4.5 mit nur Absender+Titel+Ordnerliste (kein Volltext) hier
+   │        korrekt "Dokumente/Finanzen" bzw. sogar "Dokumente/Finanzen/Steuern" wählt,
+   │        statt wie die lokalen Modelle in eine falsche, aber erzwungene Ein-Options-
+   │        Kaskade zu rutschen.
    │
    │        **Determinismus (2026-09-03):** beide Ollama-Aufrufe liefen mit
    │        `temperature=0.1` OHNE festen `seed` — ein Live-A/B-Test zeigte, dasselbe
@@ -186,6 +202,10 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
   (PROPFIND/MKCOL/PUT/GET/DELETE/MOVE); bewusst keine vollwertige WebDAV-Library, passt
   zum Wunsch nach wenig Abhängigkeiten.
 - `ollama` (offizieller Python-Client) — Chat-Aufruf mit JSON-Schema-Format.
+- `anthropic` (offizieller Python-Client) — optionaler Cloud-Fallback für die
+  Ordner-Entscheidung (`use_anthropic_classifier`), `messages.parse()` mit strukturierter
+  Pydantic-Ausgabe. Nur diese eine Entscheidung, nie Titel/Datum-Extraktion und nie der
+  OCR-Text selbst.
 - `pydantic` — Schema-Validierung der LLM-Antwort.
 - `pathvalidate` — Dateiname-Sanitizing (Umlaute bleiben erhalten, nur echte
   Sonderzeichen wie `/ \ : * ? " < > |` werden entfernt).
@@ -331,7 +351,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (118 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (133 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

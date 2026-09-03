@@ -5,10 +5,11 @@ import logging
 from datetime import date
 from typing import NamedTuple
 
+import anthropic
 import ollama
 from pydantic import ValidationError
 
-from depot.models import ContentExtraction, FolderStepDecision
+from depot.models import AnthropicFolderDecision, ContentExtraction, FolderStepDecision
 from depot.naming import closest_existing_leaf
 
 log = logging.getLogger(__name__)
@@ -116,6 +117,31 @@ vertauschen. Beispiel: "31.07.2026" im Text bedeutet issue_date "2026-07-31" \
 Titel UND Datum bist. Sei ehrlich niedrig, wenn der Text schlecht lesbar \
 oder mehrdeutig ist.
 - Antworte AUSSCHLIESSLICH mit einem JSON-Objekt passend zum vorgegebenen Schema.
+"""
+
+_ANTHROPIC_FOLDER_SYSTEM_PROMPT = """\
+Du sortierst ein gescanntes Dokument in eine bestehende, handgepflegte \
+Nextcloud-Ordnerstruktur ein.
+
+Du bekommst NUR: den extrahierten Absender, den Titel, und die \
+VOLLSTAENDIGE flache Liste aller existierenden Ordnerpfade - bewusst KEINEN \
+Dokumentinhalt (Datenschutz: der eigentliche Dokumenttext bleibt lokal).
+
+Antworte als JSON:
+- "action": "existing" wenn ein vorhandener Ordner aus der Liste wirklich \
+passt, sonst "new_folder".
+- "folder": bei "existing" EXAKT einer der Pfade aus der Liste. Bei \
+"new_folder" der EXAKT existierende Elternordner (ebenfalls woertlich aus \
+der Liste), unter dem der neue Ordner angelegt werden soll - erfinde \
+diesen Elternpfad NIEMALS.
+- "new_folder_name": nur bei "new_folder" gesetzt, NUR der Name des neuen \
+Unterordners (kein Pfad), im Stil der bestehenden Ordner.
+- "confidence": deine ehrliche Einschaetzung (0.0-1.0). Ist keine \
+Kategorie wirklich eindeutig, wähle eine plausible existierende Ober- \
+kategorie (z.B. den passenden Themen-Hauptordner) statt eine falsche \
+Unterkategorie zu erraten, und melde entsprechend moderate statt maximale \
+Konfidenz.
+- "reasoning": kurze Begruendung (1-2 Saetze), warum dieser Ordner passt.
 """
 
 _FOLDER_STEP_SYSTEM_PROMPT = """\
@@ -322,6 +348,129 @@ def _walk_folder_tree(
 
     confidence = min(confidences) if confidences else 1.0
     return current_path, is_new_folder, confidence, tags
+
+
+def _build_anthropic_folder_user_content(
+    correspondent: str, title: str, existing_folders: list[str]
+) -> str:
+    folder_list = "\n".join(sorted(existing_folders)) or "(keine Ordner vorhanden)"
+    return f"""\
+Absender: {correspondent or "(kein Absender erkannt)"}
+Titel: {title}
+
+Vollstaendige Liste existierender Ordner ({len(existing_folders)} Stueck):
+{folder_list}
+"""
+
+
+def classify_folder_via_anthropic(
+    correspondent: str,
+    title: str,
+    existing_folders: list[str],
+    dokumente_root: str,
+    anthropic_api_key: str | None,
+    anthropic_model: str,
+    timeout: float = 60.0,
+) -> tuple[str, bool, float, list[str]]:
+    """Single-shot cloud classification: unlike _walk_folder_tree, hands the
+    WHOLE existing folder tree to the model in one call instead of walking
+    it level by level - a frontier model doesn't need the small-model
+    workaround that hierarchical descent exists for. Sends ONLY
+    correspondent + title + the folder-path list, never the OCR text or
+    original filename, so the actual document content never leaves the
+    local network.
+
+    On ANY failure (no API key configured, network error, rate limit,
+    invalid response), returns confidence=0.0 instead of raising, so the
+    caller's existing confidence-threshold check routes the document to the
+    fallback folder rather than retrying the whole pipeline run - the
+    already-locally-extracted title/correspondent/date are not lost, only
+    the filing decision falls back to "needs manual review"."""
+    if not anthropic_api_key:
+        log.warning("use_anthropic_classifier is enabled but no ANTHROPIC_API_KEY is configured.")
+        return dokumente_root, False, 0.0, ["ANTHROPIC-NICHT-ERREICHBAR"]
+
+    try:
+        client = anthropic.Anthropic(api_key=anthropic_api_key, timeout=timeout)
+        user_content = _build_anthropic_folder_user_content(correspondent, title, existing_folders)
+        # No temperature/seed knob here (unlike _OLLAMA_OPTIONS above):
+        # current-generation Claude models removed sampling parameters from
+        # the API entirely (confirmed against the installed SDK - `create`/
+        # `parse` no longer accept temperature/top_p/top_k at all). Some
+        # run-to-run variance in the exact folder choice is possible, but
+        # observed live to stay within sensible options (e.g. "Finanzen" vs.
+        # the more specific "Finanzen/Steuern"), not wrong ones.
+        response = client.messages.parse(
+            model=anthropic_model,
+            max_tokens=1024,
+            system=_ANTHROPIC_FOLDER_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_content}],
+            output_format=AnthropicFolderDecision,
+        )
+        decision = response.parsed_output
+    except Exception as exc:
+        log.warning("Anthropic folder classification failed (%s); routing to fallback.", exc)
+        return dokumente_root, False, 0.0, ["ANTHROPIC-NICHT-ERREICHBAR"]
+
+    if decision.action == "existing":
+        if decision.folder in existing_folders:
+            return decision.folder, False, decision.confidence, []
+        match = closest_existing_leaf(decision.folder, existing_folders)
+        if match is not None and match[1] >= NEAR_DUPLICATE_THRESHOLD:
+            return match[0], False, decision.confidence, [
+                f"AUTO-KORRIGIERT ({decision.folder} -> {match[0]})"
+            ]
+        log.warning("Anthropic chose non-existent folder %r with no close match.", decision.folder)
+        return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"]
+
+    # action == "new_folder"
+    if not decision.new_folder_name:
+        return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"]
+
+    parent = decision.folder
+    if parent == dokumente_root or parent in existing_folders:
+        return f"{parent}/{decision.new_folder_name}", True, decision.confidence, []
+
+    match = closest_existing_leaf(parent, existing_folders)
+    if match is not None and match[1] >= NEAR_DUPLICATE_THRESHOLD:
+        return f"{match[0]}/{decision.new_folder_name}", True, decision.confidence, [
+            f"AUTO-KORRIGIERT ({parent} -> {match[0]})"
+        ]
+    log.warning("Anthropic proposed new folder under non-existent parent %r.", parent)
+    return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"]
+
+
+def classify_via_anthropic(
+    ocr_text: str,
+    original_filename: str,
+    existing_folders: list[str],
+    ollama_host: str,
+    model: str,
+    anthropic_api_key: str | None,
+    anthropic_model: str,
+    dokumente_root: str = "Dokumente",
+    timeout: float = 120.0,
+) -> tuple[ClassificationOutcome, list[str]]:
+    """Same contract as classify(), but the folder decision is delegated to
+    Anthropic (classify_folder_via_anthropic) instead of the local
+    hierarchical walk. title/correspondent/issue_date extraction still runs
+    fully locally via extract_content() - only correspondent+title+folder
+    names ever reach the cloud call."""
+    content = extract_content(ocr_text, original_filename, ollama_host, model, timeout)
+    folder, is_new_folder, folder_confidence, tags = classify_folder_via_anthropic(
+        content.correspondent, content.title, existing_folders, dokumente_root,
+        anthropic_api_key, anthropic_model,
+    )
+    overall_confidence = min(content.confidence, folder_confidence)
+    outcome = ClassificationOutcome(
+        folder=folder,
+        is_new_folder=is_new_folder,
+        title=content.title,
+        issue_date=content.issue_date,
+        correspondent=content.correspondent or None,
+        confidence=overall_confidence,
+    )
+    return outcome, tags
 
 
 def classify(

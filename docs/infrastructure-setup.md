@@ -204,15 +204,64 @@ genutzt**, keine weiteren Schritte nötig.
      normal wählbarer Ordner (kein struktureller Ausschluss) — das Modell wählte es in
      einem Fall selbst mit 0.95 Konfidenz, was den Zweck als sichtbares "muss geprüft
      werden"-Fach unterlief. Jetzt strukturell ausgeschlossen wie der Scan-Eingang-Pfad.
-  - **Weiterhin offen (real reproduziert, noch ungelöst):** hat der Absender KEINE
-    Entsprechung irgendwo im vorhandenen Baum (z.B. ein Finanzamt-Schreiben ohne
-    existierenden "Finanzamt"-Ordner), greift der neue Fuzzy-Hint nicht, und die
-    Wurzelebene bleibt die ungelöste Schwachstelle — dieses Dokument landete im
-    Live-Test weiterhin fälschlich unter `Finanzen/Vermögen/Scalable Capital`.
-    Mögliche nächste Schritte, noch nicht entschieden: anderes Modell in der
-    ~6GB-Klasse ausprobieren (z.B. Gemma 2 9B), dem Modell mehr Kontext pro Kandidat
-    geben (z.B. ein paar Beispiel-Dateinamen aus jedem Kandidatenordner statt nur den
-    Namen), oder mit mehr echten Beispieldokumenten systematisch nachtesten.
+  - **War zu diesem Zeitpunkt weiterhin offen:** hat der Absender KEINE Entsprechung
+    irgendwo im vorhandenen Baum (z.B. ein Finanzamt-Schreiben ohne existierenden
+    "Finanzamt"-Ordner), greift der neue Fuzzy-Hint nicht, und die Wurzelebene blieb die
+    ungelöste Schwachstelle — dieses Dokument landete im Live-Test weiterhin fälschlich
+    unter `Finanzen/Vermögen/Scalable Capital`. Siehe unten, wie das gelöst wurde.
+
+- **Gemma2 9B live getestet (2026-09-03), anhand des MÖVE-Benchmarks der Bundesdruckerei**
+  ([arxiv.org/pdf/2606.13111](https://arxiv.org/pdf/2606.13111), ein Benchmark speziell für
+  LLMs auf deutschen Verwaltungs-/Behördendokumenten): Gemma2 9B liegt dort bei "Topic
+  Extraction" (die zu unserer Ordner-Klassifikation nächstverwandte Aufgabe) auf **Platz 1
+  von 39 Modellen** (Score 0.671), vor Gemma3 27B, GPT-4o, Mistral Small 3.1 und Llama 3.3
+  70B; bei German QA auf Platz 5 von 39. Qwen taucht in dieser Top-10 gar nicht auf. Live
+  gegen die drei realen Testfälle aus dieser Session verglichen (`ollama pull gemma2:9b`,
+  ~5.4GB, passt auf die GTX 1060) — **Ergebnis gemischt, kein klarer Sieger:** beim
+  Bucher-GS-Fall und beim Finanzamt-Fall identisch zu Qwen2.5 (beim Finanzamt-Fall auch
+  identisch falsch — der Fuzzy-Hint griff bei keinem der beiden, da keine Absender-
+  Entsprechung existiert), beim TÜV-Prüfbericht-Fall aber sogar SCHLECHTER: landete mit
+  0.95 Konfidenz unter `Arbeit/A Plus Transport/Arbeitgeber` (ein früherer Arbeitgeber,
+  hat nichts mit einer Fahrzeugprüfung zu tun) statt wie Qwen2.5 im plausibleren
+  `Dokumente/Zertifikate`. Lehre: allgemeine Sprachbenchmarks übertragen sich nicht
+  zuverlässig auf DEPOTs konkrete Aufgabe (mehrstufige Navigation durch eine
+  personalisierte, dem Modell unbekannte Ordnerstruktur) — das ist eine andere Fähigkeit
+  als reine Themenextraktion aus einem einzelnen Text. Modell bleibt auf dem Server
+  installiert, aber NICHT als Standard umgestellt.
+
+## Cloud-Klassifikation via Anthropic (Claude) für den Ordner-Fall ohne Absender-Match (2026-09-03)
+
+Der oben beschriebene, mit lokalen Modellen ungelöste Fall (kein Absender-Ordner-Match,
+z.B. das Finanzamt-Schreiben) wurde live mit Claude Haiku 4.5 getestet — Ergebnis:
+korrekt `Dokumente/Finanzen` (0.85–0.95 Konfidenz, ehrlich statt geschönt bei 1.0)
+statt der falschen `Finanzen/Vermögen/Scalable Capital`-Kaskade. Auf Wunsch des Nutzers
+umgesetzt als optionaler Schalter `use_anthropic_classifier` in `DEPOT Config.json` (siehe
+`docs/plan.md` und `.env.example`) — delegiert NUR die Ordner-Entscheidung an die Cloud,
+Titel/Datum/Absender bleiben immer lokal. An Anthropic geht bewusst NUR `correspondent` +
+`title` + die Ordnerpfad-Liste, live verifiziert dass das ausreicht (Finanzamt-Fall sogar
+mit höherer Konfidenz ohne Volltext als mit).
+
+**API-Key-Setup (Lessons Learned):**
+- Ein **Workspace-scoped API-Key** aus der Console (console.anthropic.com → Settings →
+  API Keys, innerhalb eines konkreten Workspace angelegt), NICHT ein organisationsweiter
+  "identity-linked" Key — letzterer verlangt einen zusätzlichen `anthropic-workspace-id`
+  Header bei jedem Call, den ein einfacher `Anthropic(api_key=...)`-Client nicht mitgibt
+  (Fehler: `anthropic-workspace-id is required when authenticating with an
+  identity-linked API key`). Mit einem workspace-scoped Key trat das nicht auf.
+- Abrechnung läuft komplett getrennt von einem claude.ai Pro/Max/Team-Abo — eigenes
+  Pay-as-you-go-Billing in der Console, unabhängig vom Chat-Abo.
+- `client.messages.parse(..., output_format=PydanticModel)` (structured outputs) nimmt in
+  der installierten SDK-Version (`anthropic==1.3.0`) KEIN `temperature`/`top_p`/`top_k`
+  entgegen — aktuelle Claude-Modelle (Opus 5, Sonnet 5, Fable-Serie) haben diese
+  Sampling-Parameter aus der API entfernt (`effort` ersetzt sie für Denktiefe, steuert
+  aber nicht die Ausgabe-Varianz auf dieselbe Art). Anders als beim Ollama-Fix
+  (`temperature=0, seed=42`) gibt es hier also keinen Determinismus-Hebel — beobachtete
+  Varianz blieb in Live-Tests aber innerhalb sinnvoller Optionen (z.B. "Finanzen" vs. das
+  spezifischere "Finanzen/Steuern"), nie eine falsche Kategorie.
+- Kosten bei DEPOTs Nutzungsvolumen (gelegentliche Scan-Batches, winziger Payload:
+  Absender+Titel+Ordnerliste) vernachlässigbar: ein einzelner Testaufruf mit der
+  kompletten Ordnerliste (~280 Ordner) lag bei ca. 9K Input-Tokens ≈ unter 1 Cent bei
+  Claude Haiku 4.5 ($1/$5 pro 1M Tokens).
 
 ## Nextcloud
 

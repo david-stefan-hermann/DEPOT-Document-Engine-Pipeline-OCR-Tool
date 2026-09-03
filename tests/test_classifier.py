@@ -5,7 +5,7 @@ import ollama
 import pytest
 
 from depot import classifier
-from depot.models import ContentExtraction, FolderStepDecision
+from depot.models import AnthropicFolderDecision, ContentExtraction, FolderStepDecision
 
 
 # ---- _children_of ----------------------------------------------------
@@ -344,3 +344,168 @@ def test_classify_converts_empty_correspondent_to_none_on_outcome(monkeypatch):
         ollama_host="http://fake", model="model",
     )
     assert outcome.correspondent is None
+
+
+# ---- classify_folder_via_anthropic (cloud call, mocked) --------------------
+
+class _FakeAnthropicResponse:
+    def __init__(self, parsed_output):
+        self.parsed_output = parsed_output
+
+
+class _FakeAnthropicMessages:
+    def __init__(self, parsed_output=None, exc=None):
+        self._parsed_output = parsed_output
+        self._exc = exc
+        self.last_kwargs = None
+
+    def parse(self, **kwargs):
+        self.last_kwargs = kwargs
+        if self._exc is not None:
+            raise self._exc
+        return _FakeAnthropicResponse(self._parsed_output)
+
+
+class _FakeAnthropicClient:
+    def __init__(self, parsed_output=None, exc=None):
+        self.messages = _FakeAnthropicMessages(parsed_output, exc)
+
+
+def _decision_anthropic(action, folder="Dokumente", new_folder_name=None, confidence=0.9):
+    return AnthropicFolderDecision(
+        action=action, folder=folder, new_folder_name=new_folder_name, confidence=confidence
+    )
+
+
+def test_classify_folder_via_anthropic_existing_folder(monkeypatch):
+    fake_client = _FakeAnthropicClient(
+        parsed_output=_decision_anthropic("existing", folder="Dokumente/Gesundheit")
+    )
+    monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: fake_client)
+
+    folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+        "Techniker Krankenkasse", "Mitgliedsbescheinigung", EXISTING_FOLDERS, "Dokumente",
+        "sk-ant-fake", "claude-haiku-4-5",
+    )
+    assert folder == "Dokumente/Gesundheit"
+    assert is_new is False
+    assert confidence == 0.9
+    assert tags == []
+    # privacy contract: only correspondent/title/folder-list ever get sent,
+    # never OCR text (the function signature doesn't even accept it)
+    sent = fake_client.messages.last_kwargs
+    assert "Techniker Krankenkasse" in sent["messages"][0]["content"]
+    assert "Mitgliedsbescheinigung" in sent["messages"][0]["content"]
+
+
+def test_classify_folder_via_anthropic_new_folder_under_valid_parent(monkeypatch):
+    fake_client = _FakeAnthropicClient(
+        parsed_output=_decision_anthropic("new_folder", folder="Dokumente/Gesundheit", new_folder_name="Zahnarzt")
+    )
+    monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: fake_client)
+
+    folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+        "Dr. Beispiel", "Rechnung", EXISTING_FOLDERS, "Dokumente", "sk-ant-fake", "claude-haiku-4-5",
+    )
+    assert folder == "Dokumente/Gesundheit/Zahnarzt"
+    assert is_new is True
+    assert tags == []
+
+
+def test_classify_folder_via_anthropic_hallucinated_existing_folder_gets_fuzzy_corrected(monkeypatch):
+    fake_client = _FakeAnthropicClient(
+        parsed_output=_decision_anthropic("existing", folder="Dokumente/Gesundheiten")  # close typo
+    )
+    monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: fake_client)
+
+    folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+        "Foo", "Bar", EXISTING_FOLDERS, "Dokumente", "sk-ant-fake", "claude-haiku-4-5",
+    )
+    assert folder == "Dokumente/Gesundheit"
+    assert any("AUTO-KORRIGIERT" in t for t in tags)
+
+
+def test_classify_folder_via_anthropic_hallucinated_folder_no_match_is_capped(monkeypatch):
+    fake_client = _FakeAnthropicClient(
+        parsed_output=_decision_anthropic("existing", folder="Dokumente/Vollkommen-Erfunden", confidence=0.99)
+    )
+    monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: fake_client)
+
+    folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+        "Foo", "Bar", EXISTING_FOLDERS, "Dokumente", "sk-ant-fake", "claude-haiku-4-5",
+    )
+    assert folder == "Dokumente"
+    assert confidence == classifier.INVALID_CHOICE_CONFIDENCE_CAP
+    assert "UNGUELTIGE-ORDNERWAHL" in tags
+
+
+def test_classify_folder_via_anthropic_missing_new_folder_name_is_invalid(monkeypatch):
+    fake_client = _FakeAnthropicClient(
+        parsed_output=_decision_anthropic("new_folder", folder="Dokumente/Gesundheit", new_folder_name=None)
+    )
+    monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: fake_client)
+
+    folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+        "Foo", "Bar", EXISTING_FOLDERS, "Dokumente", "sk-ant-fake", "claude-haiku-4-5",
+    )
+    assert confidence == classifier.INVALID_CHOICE_CONFIDENCE_CAP
+    assert "UNGUELTIGE-ORDNERWAHL" in tags
+
+
+def test_classify_folder_via_anthropic_no_api_key_configured(monkeypatch):
+    folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+        "Foo", "Bar", EXISTING_FOLDERS, "Dokumente", None, "claude-haiku-4-5",
+    )
+    assert confidence == 0.0
+    assert "ANTHROPIC-NICHT-ERREICHBAR" in tags
+
+
+def test_classify_folder_via_anthropic_call_failure_falls_back_gracefully(monkeypatch):
+    fake_client = _FakeAnthropicClient(exc=RuntimeError("network down"))
+    monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: fake_client)
+
+    folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+        "Foo", "Bar", EXISTING_FOLDERS, "Dokumente", "sk-ant-fake", "claude-haiku-4-5",
+    )
+    # Must never raise - the caller's confidence-threshold check routes this
+    # to Unsortiert instead of retrying the whole pipeline run.
+    assert confidence == 0.0
+    assert "ANTHROPIC-NICHT-ERREICHBAR" in tags
+
+
+# ---- classify_via_anthropic (end-to-end, mocked) ---------------------------
+
+def test_classify_via_anthropic_combines_content_and_cloud_folder_decision(monkeypatch):
+    monkeypatch.setattr(
+        classifier, "extract_content",
+        lambda *a, **k: ContentExtraction(
+            title="Mitgliedsbescheinigung", correspondent="Techniker Krankenkasse",
+            issue_date=date(2026, 6, 10), confidence=0.8,
+        ),
+    )
+    calls = []
+
+    def fake_folder_via_anthropic(*a, **k):
+        calls.append(a)
+        return ("Dokumente/Gesundheit", False, 0.95, [])
+
+    monkeypatch.setattr(classifier, "classify_folder_via_anthropic", fake_folder_via_anthropic)
+
+    outcome, tags = classifier.classify_via_anthropic(
+        ocr_text="geheimer volltext, darf nicht an anthropic gehen",
+        original_filename="scan.pdf",
+        existing_folders=EXISTING_FOLDERS,
+        ollama_host="http://fake",
+        model="model",
+        anthropic_api_key="sk-ant-fake",
+        anthropic_model="claude-haiku-4-5",
+    )
+    assert outcome.folder == "Dokumente/Gesundheit"
+    assert outcome.title == "Mitgliedsbescheinigung"
+    assert outcome.correspondent == "Techniker Krankenkasse"
+    assert outcome.confidence == 0.8  # min(content=0.8, folder=0.95)
+    assert tags == []
+    # only correspondent + title were passed to the cloud call - no ocr_text
+    assert calls[0][:2] == ("Techniker Krankenkasse", "Mitgliedsbescheinigung")
+    assert calls[0][2] == EXISTING_FOLDERS
+    assert calls[0][3] == "Dokumente"
