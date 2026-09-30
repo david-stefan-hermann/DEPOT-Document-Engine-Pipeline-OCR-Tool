@@ -2,20 +2,24 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import date
-from typing import NamedTuple
+from typing import Callable, NamedTuple
 
 import anthropic
 import ollama
 from pydantic import ValidationError
 
+from depot import candidates as candidate_search
+from depot.candidates import STRONG_EVIDENCE, Candidate, DocumentQuery
 from depot.models import (
     AnthropicFolderDecision,
     ContentExtraction,
+    FolderPick,
     FolderStepDecision,
     extraction_json_schema,
 )
-from depot.naming import closest_existing_leaf
+from depot.naming import closest_existing_leaf, known_correspondents, normalize_correspondent
 
 log = logging.getLogger(__name__)
 
@@ -62,22 +66,25 @@ MAX_DEPTH = 12
 # landing one level too shallow with a falsely high confidence.
 INVALID_CHOICE_CONFIDENCE_CAP = 0.2
 
-# Above this similarity ratio, an extracted correspondent is treated as
-# already having a home somewhere in the existing tree (e.g. correspondent
-# "Bucher Grundstuecksservice GmbH" vs. an existing folder leaf "Bucher
-# Grundstuecksservice"), and the folder walk starts there directly instead
-# of at the Dokumente root. Slightly higher than NEAR_DUPLICATE_THRESHOLD on
-# purpose: this searches leaf names across the WHOLE tree (not just a
-# handful of siblings at one level), so the larger candidate pool deserves a
-# bit more caution against an accidental false-positive match. Real case
-# this fixes: a small model, given the top-level folder list alone (no
-# insight into what's actually inside each one), confidently but wrongly
-# filed salary slips from a clearly-named employer under Finanzen/Vermoegen/
-# instead of the employer's own existing folder under Arbeit/ - once there,
-# every subsequent level had exactly one child, so "descend" was the only
-# option and each step still reported confidence 1.0, masking how wrong the
-# very first (real, multi-way) choice was.
-CORRESPONDENT_FOLDER_MATCH_THRESHOLD = 0.87
+_YEAR_FOLDER = re.compile(r"(19|20)\d{2}")
+
+# The model's own confidence says little (it reports 0.9+ for right and
+# wrong answers alike), so how sure a filing decision is follows from what
+# backs it instead:
+# - the chosen folder already holds documents of this sender/kind;
+CONFIDENCE_BACKED = 0.9
+# - a new subfolder inside such a folder;
+CONFIDENCE_BACKED_NEW_FOLDER = 0.7
+# - nothing in the tree supports the choice: a plausible suggestion, but
+#   below the default CONFIDENCE_THRESHOLD, so the document goes to the
+#   review folder (with the suggestion in its log line) rather than being
+#   filed on a guess. Once it has been filed by hand, the next document of
+#   that kind finds it there.
+CONFIDENCE_UNBACKED = 0.5
+
+# With strong candidates present, weaker ones are only distraction.
+_SHOWN_SCORE_SHARE = 0.4
+_MAX_SHOWN_WITH_STRONG = 6
 
 
 class ClassificationOutcome(NamedTuple):
@@ -279,6 +286,139 @@ Direkte Unterordner dieser Ebene:
     ]
 
 
+_PICK_TASK = """\
+Neue Aufgabe zum selben Dokument: Es soll in eine bestehende, handgepflegte \
+Ordnerstruktur einsortiert werden. Waehle den Ordner, in den es gehoert.
+
+{candidate_block}Hauptordner der Ablage{fallback_note}:
+{top_level_block}
+
+Regeln:
+- "folder" ist der vollstaendige Pfad GENAU EINES Ordners aus den Listen \
+oben, woertlich uebernommen.
+- Das Dokument gehoert dorthin, wo bereits gleichartige Dokumente liegen: \
+gleicher Absender, gleiches Thema oder derselbe Gegenstand (z.B. dasselbe \
+Fahrzeug, derselbe Vertrag). Die Beispieldateien zeigen, was in einem Ordner \
+tatsaechlich abgelegt ist - sie sind aussagekraeftiger als der Ordnername.
+- Waehle den SPEZIFISCHSTEN passenden Ordner. Einen Hauptordner nur, wenn \
+keiner der Ordner mit Beispielen wirklich passt.
+- "new_folder_name": im Normalfall null. Nur setzen, wenn das Dokument zwar \
+in den gewaehlten Ordner gehoert, dort aber ein NEUER Unterordner dafuer \
+angelegt werden soll (z.B. ein neuer Absender oder Vorgang) - dann NUR der \
+Name des neuen Unterordners, kein Pfad, im Stil der bestehenden Ordner.
+- "confidence": deine ehrliche Einschaetzung (0.0-1.0). Niedrig, wenn \
+mehrere Ordner aehnlich gut passen oder keiner wirklich passt.
+- Antworte AUSSCHLIESSLICH mit einem JSON-Objekt passend zum vorgegebenen Schema.
+"""
+
+
+def _document_turns(
+    ocr_text: str, original_filename: str, pdf_title: str | None, content: ContentExtraction
+) -> list[dict]:
+    """The extraction conversation, replayed: the same system prompt and
+    document message extract_content() sent, followed by what was extracted.
+    A follow-up task appended to this shares its whole prefix with the
+    extraction call that ran just before it, so Ollama does not evaluate
+    the document text a second time - and the follow-up sees the document's
+    text AND its title/correspondent."""
+    extracted = {
+        "title": content.title,
+        "correspondent": content.correspondent,
+        "issue_date": content.issue_date.isoformat() if content.issue_date else None,
+        "keywords": content.keywords,
+    }
+    return [
+        *_build_content_messages(ocr_text, original_filename, pdf_title),
+        {"role": "assistant", "content": json.dumps(extracted, ensure_ascii=False)},
+    ]
+
+
+def _build_pick_messages(
+    ocr_text: str,
+    original_filename: str,
+    pdf_title: str | None,
+    content: ContentExtraction,
+    ranked: list[Candidate],
+    top_level: list[str],
+) -> tuple[list[dict], list[str]]:
+    """Messages for the one decision "which of these folders", plus the
+    offered folder paths (candidates first, then the remaining top-level
+    folders)."""
+    options: list[str] = []
+    candidate_lines: list[str] = []
+    for candidate in ranked:
+        options.append(candidate.path)
+        candidate_lines.append(f"- {candidate.path}")
+        candidate_lines += [f"    z.B. {example[:90]}" for example in candidate.examples]
+    top_level_lines = []
+    for path in top_level:
+        if path in options:
+            continue
+        options.append(path)
+        top_level_lines.append(f"- {path}")
+
+    candidate_block = ""
+    if candidate_lines:
+        candidate_block = (
+            "Ordner, in denen bereits aehnliche Dokumente liegen (darunter jeweils Beispiele dort "
+            "abgelegter Dateien):\n" + "\n".join(candidate_lines) + "\n\n"
+        )
+    task = _PICK_TASK.format(
+        candidate_block=candidate_block,
+        fallback_note=" (falls keiner der Ordner oben passt)" if candidate_lines else "",
+        top_level_block="\n".join(top_level_lines) or "(keine weiteren)",
+    )
+    messages = [*_document_turns(ocr_text, original_filename, pdf_title, content), {"role": "user", "content": task}]
+    return messages, options
+
+
+def _pick_folder(
+    ocr_text: str,
+    original_filename: str,
+    pdf_title: str | None,
+    content: ContentExtraction,
+    ranked: list[Candidate],
+    existing_folders: list[str],
+    dokumente_root: str,
+    ollama_host: str,
+    model: str,
+    timeout: float = 120.0,
+) -> tuple[str, bool, float, list[str], Candidate | None]:
+    """One model call choosing among the ranked candidates (with example
+    files) and the top-level folders. Returns (folder, is_new_folder,
+    confidence, tags, chosen candidate or None if a top-level folder was
+    chosen). The answer is constrained by the schema to the offered paths,
+    so an invented folder is impossible by construction."""
+    top_level = [f"{dokumente_root}/{name}" for name in _children_of(existing_folders, dokumente_root)]
+    messages, options = _build_pick_messages(ocr_text, original_filename, pdf_title, content, ranked, top_level)
+    if not options:
+        return dokumente_root, False, 1.0, [], None
+
+    schema = FolderPick.model_json_schema()
+    schema["properties"]["folder"] = {"type": "string", "enum": options}
+    raw_content = _chat("folder-pick", ollama_host, model, messages, schema, timeout)
+    try:
+        pick = FolderPick.model_validate(json.loads(raw_content))
+    except (json.JSONDecodeError, ValidationError) as exc:
+        raise RuntimeError(f"Model returned invalid folder-pick JSON: {exc}") from exc
+
+    if pick.folder not in options:
+        # Unreachable while the schema is enforced; never trust it blindly.
+        return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"], None
+    folder = pick.folder
+    chosen = next((c for c in ranked if c.path == folder), None)
+    tags: list[str] = []
+
+    if pick.new_folder_name:
+        siblings = _children_of(existing_folders, folder)
+        match = closest_existing_leaf(pick.new_folder_name, siblings)
+        if match is not None and match[1] >= NEAR_DUPLICATE_THRESHOLD:
+            tags.append(f"AUTO-REDIRECTED (vorgeschlagen: {pick.new_folder_name} -> genutzt: {match[0]})")
+            return f"{folder}/{match[0]}", False, pick.confidence, tags, chosen
+        return f"{folder}/{pick.new_folder_name}", True, pick.confidence, tags, chosen
+    return folder, False, pick.confidence, tags, chosen
+
+
 def _children_of(existing_folders: list[str], parent: str) -> list[str]:
     """Direct child leaf names (not full paths) of `parent` within the flat
     folder listing."""
@@ -382,30 +522,43 @@ def _walk_folder_tree(
     correspondent: str = "",
     title: str = "",
     pdf_title: str | None = None,
+    start_path: str | None = None,
+    issue_date: date | None = None,
+    by_year_only: bool = False,
 ) -> tuple[str, bool, float, list[str]]:
     """Descends the Dokumente/ tree one level at a time, asking the model at
     each level to pick a direction from a small, focused candidate set
     (that level's direct children only) instead of the entire tree at once.
     Returns (folder, is_new_folder, confidence, tags).
 
-    If `correspondent` closely matches an existing folder's leaf name
-    anywhere in the tree, the walk starts there directly instead of at
-    dokumente_root - see CORRESPONDENT_FOLDER_MATCH_THRESHOLD for why."""
-    current_path = dokumente_root
+    The descent begins at `start_path` (an already chosen folder), or at
+    dokumente_root without one.
+
+    Folders that are split purely by year are not a question for the model:
+    with a known `issue_date` the matching year is entered (or created)
+    directly. With `by_year_only` that is all that happens - no model call,
+    for a start folder that was already chosen on evidence."""
+    current_path = start_path or dokumente_root
     confidences: list[float] = []
     tags: list[str] = []
     is_new_folder = False
-
-    if correspondent:
-        match = closest_existing_leaf(correspondent, existing_folders)
-        if match is not None and match[1] >= CORRESPONDENT_FOLDER_MATCH_THRESHOLD:
-            current_path = match[0]
-            tags.append(f"ABSENDER-ORDNER-GEFUNDEN ({correspondent} -> {match[0]})")
 
     for _ in range(MAX_DEPTH):
         children = _children_of(existing_folders, current_path)
         if not children:
             break  # leaf reached, nothing to ask about
+
+        if issue_date is not None and all(_YEAR_FOLDER.fullmatch(c) for c in children):
+            year = str(issue_date.year)
+            if year in children:
+                current_path = f"{current_path}/{year}"
+                continue
+            if len(children) >= 2:
+                current_path = f"{current_path}/{year}"
+                is_new_folder = True
+                break
+        if by_year_only:
+            break
 
         decision = _decide_folder_step(
             ocr_text, original_filename, current_path, children, ollama_host, model, timeout,
@@ -559,6 +712,21 @@ def classify_folder_via_anthropic(
     return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"]
 
 
+def _prepare_content(
+    content: ContentExtraction,
+    folder_files: dict[str, list[str]] | None,
+    resolve_date: Callable[[date | None], date | None] | None,
+) -> ContentExtraction:
+    """The extraction as used for filing: sender in its canonical spelling,
+    issue date checked against the document."""
+    return content.model_copy(update={
+        "correspondent": normalize_correspondent(
+            content.correspondent, known_correspondents(folder_files or {})
+        ),
+        "issue_date": resolve_date(content.issue_date) if resolve_date else content.issue_date,
+    })
+
+
 def classify_via_anthropic(
     ocr_text: str,
     original_filename: str,
@@ -572,14 +740,19 @@ def classify_via_anthropic(
     content: ContentExtraction | None = None,
     filename_title: str | None = None,
     pdf_title: str | None = None,
+    folder_files: dict[str, list[str]] | None = None,
+    resolve_date: Callable[[date | None], date | None] | None = None,
 ) -> tuple[ClassificationOutcome, list[str]]:
     """Same contract as classify(), but the folder decision is delegated to
-    Anthropic (classify_folder_via_anthropic) instead of the local
-    hierarchical walk. title/correspondent/issue_date extraction still runs
-    fully locally via extract_content() - see classify_folder_via_anthropic
-    for exactly what reaches the cloud call."""
+    Anthropic (classify_folder_via_anthropic) instead of the local candidate
+    search. title/correspondent/issue_date extraction still runs fully
+    locally via extract_content() - see classify_folder_via_anthropic for
+    exactly what reaches the cloud call. `folder_files` is only used locally
+    (canonical sender spelling); no filename of an already filed document
+    is ever sent."""
     if content is None:
         content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title)
+    content = _prepare_content(content, folder_files, resolve_date)
     folder, is_new_folder, folder_confidence, tags = classify_folder_via_anthropic(
         content.correspondent, content.title, existing_folders, dokumente_root,
         anthropic_api_key, anthropic_model,
@@ -607,22 +780,77 @@ def classify(
     timeout: float = 120.0,
     content: ContentExtraction | None = None,
     pdf_title: str | None = None,
+    folder_files: dict[str, list[str]] | None = None,
+    resolve_date: Callable[[date | None], date | None] | None = None,
+    filename_title: str | None = None,
 ) -> tuple[ClassificationOutcome, list[str]]:
-    """Classifies one document: extracts title/date independently of the
-    folder structure, then walks the Dokumente/ tree level by level to find
-    (or create) the right destination folder. Raises on infrastructure
-    failures (unreachable Ollama, invalid response) so the caller can treat
-    those as transient and retry/fallback accordingly.
+    """Classifies one document:
+    1. extract title/date/correspondent, independent of the folder structure;
+    2. shortlist the folders that already hold similar documents
+       (candidates.rank_candidates - deterministic, from folder names and
+       the names of the files in them);
+    3. one model call picks among those candidates and the top-level folders;
+    4. from the picked folder, descend further only where it still has
+       subfolders.
+    Raises on infrastructure failures (unreachable Ollama, invalid response)
+    so the caller can treat those as transient and retry/fallback
+    accordingly.
 
     Pass `content` to skip the extraction call when title/correspondent are
     already known some other way (e.g. taken from the filename because OCR
-    found no text)."""
+    found no text). `folder_files` maps each existing folder to the names of
+    the files directly in it; without it the shortlist can only go by folder
+    names. `resolve_date` turns the model's issue date into the one to trust
+    (see signals.resolve_issue_date)."""
     if content is None:
         content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title)
-    folder, is_new_folder, folder_confidence, tags = _walk_folder_tree(
-        ocr_text, original_filename, existing_folders, dokumente_root, ollama_host, model, timeout,
-        correspondent=content.correspondent, title=content.title, pdf_title=pdf_title,
+    content = _prepare_content(content, folder_files, resolve_date)
+
+    ranked = candidate_search.rank_candidates(
+        DocumentQuery(
+            correspondent=content.correspondent,
+            title=content.title,
+            keywords=content.keywords,
+            filename_title=filename_title or "",
+            pdf_title=pdf_title or "",
+            text=ocr_text,
+        ),
+        existing_folders,
+        folder_files,
     )
+    if ranked and ranked[0].strength >= STRONG_EVIDENCE:
+        floor = _SHOWN_SCORE_SHARE * ranked[0].score
+        ranked = [c for c in ranked if c.score >= floor][:_MAX_SHOWN_WITH_STRONG]
+
+    folder, is_new_folder, _, tags, chosen = _pick_folder(
+        ocr_text, original_filename, pdf_title, content, ranked, existing_folders, dokumente_root,
+        ollama_host, model, timeout,
+    )
+    # Backed by evidence: the folder matches strongly, or earlier documents
+    # of this very sender are filed there (in the evaluation the single most
+    # reliable sign - right in 31 of 33 cases).
+    backed = chosen is not None and (chosen.strength >= STRONG_EVIDENCE or chosen.sender_files > 0)
+    if is_new_folder:
+        folder_confidence = CONFIDENCE_BACKED_NEW_FOLDER if backed else CONFIDENCE_UNBACKED
+    else:
+        # A folder chosen on evidence is final except for its year
+        # subfolders; a bare top-level folder is only the start of the
+        # level-by-level descent.
+        folder, is_new_folder, _, walk_tags = _walk_folder_tree(
+            ocr_text, original_filename, existing_folders, dokumente_root, ollama_host, model, timeout,
+            correspondent=content.correspondent, title=content.title, pdf_title=pdf_title,
+            start_path=folder, issue_date=content.issue_date, by_year_only=chosen is not None,
+        )
+        tags += walk_tags
+        folder_confidence = CONFIDENCE_BACKED if backed else CONFIDENCE_UNBACKED
+        if "UNGUELTIGE-ORDNERWAHL" in walk_tags:
+            folder_confidence = min(folder_confidence, INVALID_CHOICE_CONFIDENCE_CAP)
+    if chosen is not None:
+        rank = next((n for n, c in enumerate(ranked, 1) if c.path == chosen.path), 0)
+        tags.append(f"KANDIDAT-{rank} (Beleg {chosen.strength:.1f}, Absender-Dateien {chosen.sender_files})")
+    else:
+        tags.append("OHNE-KANDIDAT")
+
     overall_confidence = min(content.confidence, folder_confidence)
     outcome = ClassificationOutcome(
         folder=folder,

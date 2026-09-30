@@ -168,80 +168,6 @@ def test_walk_with_no_top_level_folders_stays_at_root():
     assert tags == []
 
 
-# ---- correspondent-folder-match hint --------------------------------------
-
-EMPLOYER_FOLDERS = [
-    "Dokumente/Arbeit",
-    "Dokumente/Arbeit/Bucher Grundstücksservice",
-    "Dokumente/Arbeit/Bucher Grundstücksservice/Persönlich",
-    "Dokumente/Finanzen",
-    "Dokumente/Finanzen/Vermögen",
-    "Dokumente/Finanzen/Vermögen/Scalable Capital",
-]
-
-
-def test_walk_starts_at_correspondent_matched_folder(monkeypatch):
-    """The real production bug this fixes: with only top-level folder NAMES
-    to go on (no insight into folder contents), the model picked the wrong
-    branch for a payslip from a clearly-named employer. Once the employer
-    name closely matches an EXISTING folder leaf anywhere in the tree, skip
-    straight there instead of gambling on the root-level category guess."""
-    seen_levels = []
-
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
-        seen_levels.append(current_path)
-        return _decision("stay", confidence=0.9)
-
-    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
-
-    folder, is_new, confidence, tags = classifier._walk_folder_tree(
-        "Entgeltabrechnung ... Bucher Grundstücksservice GmbH ...",
-        "scan.pdf",
-        EMPLOYER_FOLDERS,
-        "Dokumente",
-        "http://fake",
-        "model",
-        correspondent="Bucher Grundstücksservice GmbH",
-    )
-
-    assert seen_levels == ["Dokumente/Arbeit/Bucher Grundstücksservice"]
-    assert folder == "Dokumente/Arbeit/Bucher Grundstücksservice"
-    assert any("ABSENDER-ORDNER-GEFUNDEN" in t for t in tags)
-
-
-def test_walk_ignores_weak_correspondent_match(monkeypatch):
-    seen_levels = []
-
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
-        seen_levels.append(current_path)
-        return _decision("stay", confidence=0.9)
-
-    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
-
-    classifier._walk_folder_tree(
-        "text", "scan.pdf", EMPLOYER_FOLDERS, "Dokumente", "http://fake", "model",
-        correspondent="Voellig Unrelated Absender",
-    )
-
-    assert seen_levels == ["Dokumente"]
-
-
-def test_walk_without_correspondent_starts_at_root(monkeypatch):
-    seen_levels = []
-
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
-        seen_levels.append(current_path)
-        return _decision("stay", confidence=0.9)
-
-    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
-
-    classifier._walk_folder_tree(
-        "text", "scan.pdf", EMPLOYER_FOLDERS, "Dokumente", "http://fake", "model", correspondent=""
-    )
-
-    assert seen_levels == ["Dokumente"]
-
-
 # ---- extract_content / _decide_folder_step (real ollama call, mocked) ----
 
 class _FakeClient:
@@ -296,6 +222,10 @@ def test_decide_folder_step_parses_valid_response(monkeypatch):
 
 # ---- classify() end-to-end (mocked at the extract_content/_walk_folder_tree level) ----
 
+def _fake_pick(folder, is_new=False, confidence=0.95, tags=(), chosen=None):
+    return lambda *a, **k: (folder, is_new, confidence, list(tags), chosen)
+
+
 def test_classify_combines_content_and_folder_walk(monkeypatch):
     monkeypatch.setattr(
         classifier, "extract_content",
@@ -309,6 +239,7 @@ def test_classify_combines_content_and_folder_walk(monkeypatch):
         walk_calls.append(k)
         return ("Dokumente/Gesundheit/Krankenkasse", False, 0.95, [])
 
+    monkeypatch.setattr(classifier, "_pick_folder", _fake_pick("Dokumente/Gesundheit"))
     monkeypatch.setattr(classifier, "_walk_folder_tree", fake_walk)
 
     outcome, tags = classifier.classify(
@@ -322,10 +253,13 @@ def test_classify_combines_content_and_folder_walk(monkeypatch):
     assert outcome.title == "Arztrechnung"
     assert outcome.correspondent == "Dr. Müller"
     assert outcome.issue_date == date(2026, 6, 10)
-    assert outcome.confidence == 0.8  # min(content=0.8, folder=0.95)
-    assert tags == []
-    # the extracted correspondent must be threaded into the folder walk so
-    # it can be used for the correspondent-folder-match hint
+    # a top-level folder picked without any candidate backing it: a
+    # suggestion only, whatever confidence the model itself reported
+    assert outcome.confidence == classifier.CONFIDENCE_UNBACKED
+    assert tags == ["OHNE-KANDIDAT"]
+    # the level-by-level descent continues from the picked top-level folder
+    assert walk_calls[0]["start_path"] == "Dokumente/Gesundheit"
+    assert walk_calls[0]["by_year_only"] is False
     assert walk_calls[0]["correspondent"] == "Dr. Müller"
 
 
@@ -334,6 +268,7 @@ def test_classify_converts_empty_correspondent_to_none_on_outcome(monkeypatch):
         classifier, "extract_content",
         lambda *a, **k: ContentExtraction(title="Notiz", correspondent="", confidence=0.5),
     )
+    monkeypatch.setattr(classifier, "_pick_folder", _fake_pick("Dokumente"))
     monkeypatch.setattr(
         classifier, "_walk_folder_tree",
         lambda *a, **k: ("Dokumente", False, 0.5, []),
@@ -570,6 +505,7 @@ def test_classify_with_given_content_skips_extraction(monkeypatch):
         walk_kwargs.append(k)
         return ("Dokumente/Motorrad", False, 0.9, [])
 
+    monkeypatch.setattr(classifier, "_pick_folder", _fake_pick("Dokumente/Motorrad"))
     monkeypatch.setattr(classifier, "_walk_folder_tree", fake_walk)
 
     outcome, _ = classifier.classify(
@@ -580,7 +516,7 @@ def test_classify_with_given_content_skips_extraction(monkeypatch):
 
     assert outcome.folder == "Dokumente/Motorrad"
     assert outcome.title == "motorrad anhaenger"
-    assert outcome.confidence == 0.7
+    assert outcome.confidence == classifier.CONFIDENCE_UNBACKED
     assert walk_kwargs[0]["title"] == "motorrad anhaenger"
 
 
@@ -640,3 +576,344 @@ def test_cloud_call_gets_filename_pdf_title_and_keywords_but_no_document_text(mo
     assert "PDF-Titel: Ende der Teilnahme" in sent
     assert "Stichworte: Krankenversicherung, Kuendigung" in sent
     assert "GEHEIMER VOLLTEXT" not in sent
+
+
+# ---- candidate shortlist + single pick ----------------------------------------
+
+TREE = [
+    "Dokumente/Versicherungen",
+    "Dokumente/Fahrzeuge",
+    "Dokumente/Fahrzeuge/MT-07",
+    "Dokumente/Fahrzeuge/MT-07/Versicherung",
+    "Dokumente/Finanzen",
+    "Dokumente/Finanzen/Depot",
+    "Dokumente/Finanzen/Depot/2024",
+    "Dokumente/Finanzen/Depot/2025",
+]
+TREE_FILES = {
+    "Dokumente/Fahrzeuge/MT-07/Versicherung": [
+        "2025-03-01 Beispiel Versicherung - Beitragsrechnung.pdf",
+        "2024-03-01 Beispiel Versicherung - Versicherungsschein.pdf",
+    ],
+    "Dokumente/Finanzen/Depot/2025": ["2025-02-01 Musterbank - Wertpapierabrechnung.pdf"],
+}
+INSURANCE_LETTER = ContentExtraction(
+    title="Beitragsrechnung", correspondent="Beispiel Versicherung", issue_date=date(2026, 3, 1),
+    confidence=0.9, keywords=["Versicherung", "Beitrag"],
+)
+
+
+class _PickClient:
+    """Answers the folder-pick call with a fixed choice and records it."""
+
+    def __init__(self, answer):
+        self._answer = answer
+        self.calls = []
+
+    def chat(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"message": {"content": json.dumps(self._answer)}}
+
+
+def _ranked(content=INSURANCE_LETTER):
+    from depot.candidates import DocumentQuery, rank_candidates
+
+    return rank_candidates(
+        DocumentQuery(correspondent=content.correspondent, title=content.title, keywords=content.keywords),
+        TREE, TREE_FILES,
+    )
+
+
+def test_pick_offers_candidates_with_examples_then_the_top_level_folders(monkeypatch):
+    client = _PickClient(
+        {"folder": "Dokumente/Fahrzeuge/MT-07/Versicherung", "new_folder_name": None, "confidence": 0.9}
+    )
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: client)
+    ranked = _ranked()
+
+    folder, is_new, confidence, tags, chosen = classifier._pick_folder(
+        "OCR-VOLLTEXT", "scan.pdf", None, INSURANCE_LETTER, ranked, TREE, "Dokumente", "http://fake", "model"
+    )
+
+    assert folder == "Dokumente/Fahrzeuge/MT-07/Versicherung"
+    assert (is_new, confidence, tags) == (False, 0.9, [])
+    assert chosen is ranked[0]
+    task = client.calls[0]["messages"][-1]["content"]
+    assert "- Dokumente/Fahrzeuge/MT-07/Versicherung\n" in task
+    assert "z.B. 2025-03-01 Beispiel Versicherung - Beitragsrechnung.pdf" in task
+    # every top-level folder is offered exactly once, after the candidates
+    for top in ("Dokumente/Fahrzeuge", "Dokumente/Finanzen", "Dokumente/Versicherungen"):
+        assert task.count(f"- {top}\n") == 1
+    assert task.index("Dokumente/Fahrzeuge/MT-07/Versicherung") < task.index("Hauptordner der Ablage")
+
+
+def test_pick_shares_its_prefix_with_the_extraction_call(monkeypatch):
+    """The decision is a follow-up turn of the extraction conversation, so
+    Ollama does not evaluate the document text again - and the decision
+    sees the text together with the extracted title and sender."""
+    client = _PickClient({"folder": "Dokumente/Fahrzeuge/MT-07/Versicherung", "confidence": 0.9})
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: client)
+
+    classifier._pick_folder(
+        "OCR-VOLLTEXT", "scan.pdf", "PDF-Titel", INSURANCE_LETTER, _ranked(), TREE, "Dokumente",
+        "http://fake", "model",
+    )
+
+    messages = client.calls[0]["messages"]
+    assert messages[:2] == classifier._build_content_messages("OCR-VOLLTEXT", "scan.pdf", "PDF-Titel")
+    assert messages[2]["role"] == "assistant"
+    assert json.loads(messages[2]["content"])["correspondent"] == "Beispiel Versicherung"
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+
+
+def test_pick_answer_is_restricted_to_the_offered_folders(monkeypatch):
+    """The answer is the folder path itself, limited by the schema to what
+    was offered - asked for a list number instead, the model's choice
+    followed the order of the list rather than the document."""
+    client = _PickClient({"folder": "Dokumente/Fahrzeuge/MT-07/Versicherung", "confidence": 0.8})
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: client)
+    ranked = _ranked()
+
+    classifier._pick_folder(
+        "text", "scan.pdf", None, INSURANCE_LETTER, ranked, TREE, "Dokumente", "http://fake", "model"
+    )
+
+    allowed = client.calls[0]["format"]["properties"]["folder"]["enum"]
+    assert allowed[:len(ranked)] == [c.path for c in ranked]
+    assert set(allowed) == {c.path for c in ranked} | {
+        "Dokumente/Versicherungen", "Dokumente/Fahrzeuge", "Dokumente/Finanzen"
+    }
+    assert len(allowed) == len(set(allowed))
+
+
+def test_pick_of_a_folder_that_was_not_offered_is_not_trusted(monkeypatch):
+    client = _PickClient({"folder": "Dokumente/Frei Erfunden", "confidence": 0.99})
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: client)
+
+    folder, is_new, confidence, tags, chosen = classifier._pick_folder(
+        "text", "scan.pdf", None, INSURANCE_LETTER, _ranked(), TREE, "Dokumente", "http://fake", "model"
+    )
+
+    assert (folder, is_new, chosen) == ("Dokumente", False, None)
+    assert confidence == classifier.INVALID_CHOICE_CONFIDENCE_CAP
+    assert "UNGUELTIGE-ORDNERWAHL" in tags
+
+
+def test_pick_of_a_top_level_folder_reports_no_candidate(monkeypatch):
+    insurance_only = [c for c in _ranked() if c.path != "Dokumente/Finanzen"]
+    client = _PickClient({"folder": "Dokumente/Finanzen", "confidence": 0.6})
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: client)
+
+    folder, _, _, _, chosen = classifier._pick_folder(
+        "text", "scan.pdf", None, INSURANCE_LETTER, insurance_only, TREE, "Dokumente", "http://fake", "model"
+    )
+
+    assert chosen is None
+    assert folder == "Dokumente/Finanzen"
+
+
+def test_pick_can_create_a_new_subfolder_under_the_chosen_folder(monkeypatch):
+    client = _PickClient({
+        "folder": "Dokumente/Fahrzeuge/MT-07/Versicherung", "new_folder_name": "Schaden 2026", "confidence": 0.8,
+    })
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: client)
+
+    folder, is_new, _, _, _ = classifier._pick_folder(
+        "text", "scan.pdf", None, INSURANCE_LETTER, _ranked(), TREE, "Dokumente", "http://fake", "model"
+    )
+
+    assert folder == "Dokumente/Fahrzeuge/MT-07/Versicherung/Schaden 2026"
+    assert is_new is True
+
+
+def test_pick_redirects_a_near_duplicate_new_subfolder(monkeypatch):
+    ranked = _ranked()
+    client = _PickClient(
+        {"folder": "Dokumente/Fahrzeuge/MT-07", "new_folder_name": "Versicherungen", "confidence": 0.8}
+    )
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: client)
+
+    folder, is_new, _, tags, _ = classifier._pick_folder(
+        "text", "scan.pdf", None, INSURANCE_LETTER, ranked, TREE, "Dokumente", "http://fake", "model"
+    )
+
+    assert folder == "Dokumente/Fahrzeuge/MT-07/Versicherung"
+    assert is_new is False
+    assert any("AUTO-REDIRECTED" in t for t in tags)
+
+
+def test_pick_without_any_folders_stays_at_the_root():
+    folder, is_new, confidence, tags, chosen = classifier._pick_folder(
+        "text", "scan.pdf", None, INSURANCE_LETTER, [], [], "Dokumente", "http://fake", "model"
+    )
+    assert (folder, is_new, chosen) == ("Dokumente", False, None)
+
+
+# ---- year subfolders are not a question for the model -------------------------
+
+def _no_model_call(*a, **k):
+    raise AssertionError("year folders must be resolved without asking the model")
+
+
+def test_walk_enters_the_matching_year_folder_by_itself(monkeypatch):
+    monkeypatch.setattr(classifier, "_decide_folder_step", _no_model_call)
+
+    folder, is_new, confidence, tags = classifier._walk_folder_tree(
+        "text", "scan.pdf", TREE, "Dokumente", "http://fake", "model",
+        start_path="Dokumente/Finanzen/Depot", issue_date=date(2025, 2, 1),
+    )
+
+    assert (folder, is_new) == ("Dokumente/Finanzen/Depot/2025", False)
+
+
+def test_walk_creates_the_missing_year_in_a_folder_split_by_year(monkeypatch):
+    monkeypatch.setattr(classifier, "_decide_folder_step", _no_model_call)
+
+    folder, is_new, confidence, tags = classifier._walk_folder_tree(
+        "text", "scan.pdf", TREE, "Dokumente", "http://fake", "model",
+        start_path="Dokumente/Finanzen/Depot", issue_date=date(2026, 1, 15),
+    )
+
+    assert (folder, is_new) == ("Dokumente/Finanzen/Depot/2026", True)
+
+
+def test_walk_asks_the_model_about_year_folders_when_the_date_is_unknown(monkeypatch):
+    asked = []
+
+    def fake_decide(ocr_text, original_filename, current_path, children, *a, **k):
+        asked.append(children)
+        return _decision("stay")
+
+    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
+
+    folder, _, _, _ = classifier._walk_folder_tree(
+        "text", "scan.pdf", TREE, "Dokumente", "http://fake", "model",
+        start_path="Dokumente/Finanzen/Depot", issue_date=None,
+    )
+
+    assert asked == [["2024", "2025"]]
+    assert folder == "Dokumente/Finanzen/Depot"
+
+
+# ---- classify(): the whole local flow -------------------------------------------
+
+def test_classify_picks_among_candidates_then_descends_by_year(monkeypatch):
+    statement = ContentExtraction(
+        title="Wertpapierabrechnung", correspondent="Musterbank AG", issue_date=date(2025, 6, 1), confidence=0.9
+    )
+    picks = []
+
+    def fake_pick(ocr_text, original_filename, pdf_title, content, ranked, *a, **k):
+        picks.append((content, ranked))
+        depot = next(c for c in ranked if c.path == "Dokumente/Finanzen/Depot")
+        return (depot.path, False, 0.9, [], depot)
+
+    monkeypatch.setattr(classifier, "_pick_folder", fake_pick)
+    monkeypatch.setattr(classifier, "_decide_folder_step", _no_model_call)
+
+    outcome, tags = classifier.classify(
+        ocr_text="Wertpapierabrechnung Musterbank", original_filename="scan.pdf", existing_folders=TREE,
+        ollama_host="http://fake", model="model", content=statement, folder_files=TREE_FILES,
+    )
+
+    assert outcome.folder == "Dokumente/Finanzen/Depot/2025"
+    assert outcome.is_new_folder is False
+    # the sender is filed under its canonical spelling, without the legal form
+    assert outcome.correspondent == "Musterbank"
+    assert picks[0][0].correspondent == "Musterbank"
+    # year folders are folded into their parent: never offered on their own
+    assert not any(c.path.endswith(("/2024", "/2025")) for c in picks[0][1])
+    # backed by the sender's earlier statement in that folder
+    assert outcome.confidence == classifier.CONFIDENCE_BACKED
+    assert any(t.startswith("KANDIDAT-1 (Beleg ") for t in tags)
+
+
+def test_classify_uses_the_resolved_date_for_the_year_folder(monkeypatch):
+    """The year folder must follow the date that was checked against the
+    document, not whatever the model first said."""
+    statement = ContentExtraction(
+        title="Wertpapierabrechnung", correspondent="Musterbank", issue_date=date(2024, 1, 1), confidence=0.9
+    )
+    monkeypatch.setattr(classifier, "_pick_folder", _fake_pick("Dokumente/Finanzen/Depot"))
+    monkeypatch.setattr(classifier, "_decide_folder_step", _no_model_call)
+
+    outcome, _ = classifier.classify(
+        ocr_text="text", original_filename="scan.pdf", existing_folders=TREE,
+        ollama_host="http://fake", model="model", content=statement, folder_files=TREE_FILES,
+        resolve_date=lambda d: date(2025, 3, 3),
+    )
+
+    assert outcome.issue_date == date(2025, 3, 3)
+    assert outcome.folder == "Dokumente/Finanzen/Depot/2025"
+
+
+def _classify_insurance_letter(monkeypatch, pick):
+    monkeypatch.setattr(classifier, "_pick_folder", pick)
+    monkeypatch.setattr(classifier, "_decide_folder_step", lambda *a, **k: _decision("stay", confidence=0.99))
+    return classifier.classify(
+        ocr_text="text", original_filename="scan.pdf", existing_folders=TREE,
+        ollama_host="http://fake", model="model", content=INSURANCE_LETTER, folder_files=TREE_FILES,
+    )
+
+
+def test_confidence_follows_the_evidence_not_the_models_own_number(monkeypatch):
+    """The model reports 0.9+ for right and wrong answers alike. What counts
+    is whether the chosen folder already holds documents like this one."""
+    def pick_backed(ocr_text, original_filename, pdf_title, content, ranked, *a, **k):
+        best = ranked[0]
+        assert best.path == "Dokumente/Fahrzeuge/MT-07/Versicherung"
+        return (best.path, False, 0.3, [], best)  # the model's own 0.3 is ignored
+
+    outcome, tags = _classify_insurance_letter(monkeypatch, pick_backed)
+
+    assert outcome.folder == "Dokumente/Fahrzeuge/MT-07/Versicherung"
+    assert outcome.confidence == classifier.CONFIDENCE_BACKED
+
+
+def test_top_level_choice_despite_candidates_is_only_a_suggestion(monkeypatch):
+    outcome, tags = _classify_insurance_letter(
+        monkeypatch, _fake_pick("Dokumente/Versicherungen", confidence=0.99)
+    )
+
+    assert outcome.folder == "Dokumente/Versicherungen"
+    assert outcome.confidence == classifier.CONFIDENCE_UNBACKED
+    assert "OHNE-KANDIDAT" in tags
+
+
+def test_weakly_matching_candidate_is_only_a_suggestion(monkeypatch):
+    from depot.candidates import Candidate
+
+    weak = Candidate(path="Dokumente/Finanzen", score=3.0, strength=1.0)
+    outcome, tags = _classify_insurance_letter(monkeypatch, _fake_pick(weak.path, confidence=0.99, chosen=weak))
+
+    assert outcome.confidence == classifier.CONFIDENCE_UNBACKED
+
+
+def test_new_subfolder_in_a_backed_folder_is_filed_with_reduced_confidence(monkeypatch):
+    def pick_new(ocr_text, original_filename, pdf_title, content, ranked, *a, **k):
+        return (f"{ranked[0].path}/Schaden 2026", True, 0.9, [], ranked[0])
+
+    outcome, tags = _classify_insurance_letter(monkeypatch, pick_new)
+
+    assert outcome.is_new_folder is True
+    assert outcome.confidence == classifier.CONFIDENCE_BACKED_NEW_FOLDER
+
+
+def test_backed_folder_is_not_descended_any_further_by_the_model(monkeypatch):
+    """Seen in the evaluation: after a correct pick the level-by-level walk
+    went on into an unrelated, very specific subfolder."""
+    from depot.candidates import Candidate
+
+    def _no_step(*a, **k):
+        raise AssertionError("a folder chosen on evidence must not be descended by another model call")
+
+    strong = Candidate(path="Dokumente/Fahrzeuge/MT-07", score=50.0, strength=9.0)
+    monkeypatch.setattr(classifier, "_pick_folder", _fake_pick(strong.path, chosen=strong))
+    monkeypatch.setattr(classifier, "_decide_folder_step", _no_step)
+
+    outcome, _ = classifier.classify(
+        ocr_text="text", original_filename="scan.pdf", existing_folders=TREE,
+        ollama_host="http://fake", model="model", content=INSURANCE_LETTER, folder_files=TREE_FILES,
+    )
+
+    assert outcome.folder == "Dokumente/Fahrzeuge/MT-07"

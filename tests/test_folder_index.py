@@ -32,3 +32,18 @@ def test_list_local_folders_matches_webdav_style_paths(tmp_path):
 
 def test_list_local_folders_returns_none_when_root_is_missing(tmp_path):
     assert list_local_folders(tmp_path, "Dokumente") is None
+
+
+def test_scan_local_tree_maps_folders_to_their_files(tmp_path):
+    from depot.folder_index import scan_local_tree
+
+    (tmp_path / "Dokumente" / "Motorrad" / "Rechnungen").mkdir(parents=True)
+    (tmp_path / "Dokumente" / "Motorrad" / "b.pdf").write_bytes(b"x")
+    (tmp_path / "Dokumente" / "Motorrad" / "a.pdf").write_bytes(b"x")
+    (tmp_path / "Dokumente" / "lose datei.pdf").write_bytes(b"x")
+
+    assert scan_local_tree(tmp_path, "Dokumente") == {
+        "Dokumente/Motorrad": ["a.pdf", "b.pdf"],
+        "Dokumente/Motorrad/Rechnungen": [],
+    }
+    assert scan_local_tree(tmp_path, "Gibt es nicht") is None

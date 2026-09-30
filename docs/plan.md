@@ -129,52 +129,56 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │           ohne Tag, was die Funktion als sichtbares "muss geprüft werden"-Fach
    │           unterlief)
    │
-   ├─► classifier.py — nur wenn file_into_dokumente aktiv ist (sonst nur Schritt 1),
-   │   zwei getrennte Schritte statt einem Aufruf mit der ganzen Ordnerliste auf einmal
-   │   (Grund: bei einer sehr großen/tiefen Struktur verliert ein kleines Modell sonst
-   │   den Faden und wählt Unsinn — real aufgetreten):
-   │     1. extract_content(): ein Ollama-Aufruf, NUR OCR-Text + Dateiname, ohne
-   │        Ordnerkontext → {title, issue_date, correspondent, confidence}.
-   │        `correspondent` ist PFLICHTFELD im JSON-Schema (nicht optional) — ein
-   │        Live-Test zeigte, dass das kleine Modell ein optionales Feld praktisch immer
-   │        mit null beantwortet, selbst mit expliziter Prompt-Anweisung, ein PFLICHT-
-   │        Feld aber zuverlässig befüllt. Leerstring "" bleibt als "wirklich kein
-   │        Absender erkennbar" gültig.
-   │     2. _walk_folder_tree(): steigt Ebene für Ebene durch Dokumente/ ab. Pro
-   │        Ebene ein Ollama-Aufruf mit nur den direkten Unterordnern DIESER Ebene
-   │        (plus vollem Dokumenttext erneut) → "descend"/"stay"/"new_folder".
-   │        Startet NICHT zwingend bei Dokumente/: matcht `correspondent` zuerst per
-   │        Fuzzy-Vergleich (`closest_existing_leaf`, Schwelle 0.87) gegen JEDEN
-   │        Ordner-Leaf-Namen im GESAMTEN Baum — bei einem Treffer beginnt der Abstieg
-   │        direkt dort. Grund (real aufgetreten): ohne diesen Hinweis sieht das Modell
-   │        auf der Wurzelebene nur 15 Ordnernamen ohne jeden Einblick, was darin
-   │        eigentlich liegt, und wählte für eine Gehaltsabrechnung von "Bucher
-   │        Grundstücksservice GmbH" die komplett falsche Kategorie "Finanzen" statt
-   │        "Arbeit/Bucher Grundstücksservice" (der Ordner existierte bereits exakt so).
-   │        Ab der falschen Wurzel-Wahl hatte jede weitere Ebene nur noch genau EINEN
-   │        Unterordner zur Auswahl — "descend" war die einzig mögliche Antwort, und das
-   │        Modell meldete an jeder dieser trivialen Ein-Optionen-Stufen konsequent
-   │        Konfidenz 1.0, was die eine echte (falsche) Entscheidung ganz oben im Baum
-   │        völlig verschleierte. Ungültige/halluzinierte Wahlen (erfundener
-   │        "descend"-Zielname ohne Fuzzy-Match, oder leerer "new_folder"-Name) werden
-   │        gegen die (kleine) Kandidatenliste dieser Ebene korrigiert oder sicher als
-   │        "stay" behandelt — UND die für diesen Schritt gemeldete Konfidenz wird hart
-   │        auf max. 0.2 gekappt (der Modellwert selbst ist in diesem Fall nicht
-   │        vertrauenswürdig; vorher konnte ein halluzinierter Schritt mit z.B. 0.95
-   │        gemeldeter Konfidenz das Dokument fälschlich sicher wirkend eine Ebene zu
-   │        flach ablegen). Gesamt-Konfidenz = niedrigste Einzelkonfidenz über Inhalt +
-   │        alle Schritte.
-   │        **Bekannte Grenze, wenn KEIN Absender-Ordner-Match existiert** (z.B. ein
-   │        Finanzamt-Schreiben ohne existierenden "Finanzamt"-Ordner): greift der
-   │        Fuzzy-Hint nicht, und das lokale Modell (egal ob Qwen2.5 oder Gemma2 9B,
-   │        beide per Live-Test bestätigt) bleibt bei der ungelösten Wurzel-Entscheidung
-   │        mit dem oben beschriebenen Ein-Optionen-Kaskaden-Problem — reale
-   │        Fehlklassifikation, live gegen die echte Ordnerstruktur bestätigt. Genau für
-   │        DIESEN Fall existiert `use_anthropic_classifier` (s.o.): live verifiziert,
-   │        dass Claude Haiku 4.5 mit nur Absender+Titel+Ordnerliste (kein Volltext) hier
-   │        korrekt "Dokumente/Finanzen" bzw. sogar "Dokumente/Finanzen/Steuern" wählt,
-   │        statt wie die lokalen Modelle in eine falsche, aber erzwungene Ein-Options-
-   │        Kaskade zu rutschen.
+   ├─► classifier.py — nur wenn file_into_dokumente aktiv ist (sonst nur Schritt 1):
+   │     1. extract_content(): ein Ollama-Aufruf, NUR OCR-Text + Dateiname (+ PDF-Titel),
+   │        ohne Ordnerkontext → {title, issue_date, correspondent, keywords,
+   │        confidence}. `correspondent` ist PFLICHTFELD im JSON-Schema (nicht
+   │        optional) — ein Live-Test zeigte, dass das kleine Modell ein optionales Feld
+   │        praktisch immer mit null beantwortet, selbst mit expliziter Prompt-Anweisung,
+   │        ein PFLICHT-Feld aber zuverlässig befüllt. Leerstring "" bleibt als "wirklich
+   │        kein Absender erkennbar" gültig. Danach ohne LLM: Rechtsform/Adresse vom
+   │        Absender entfernen und an die bereits verwendete Schreibweise angleichen
+   │        (`naming.normalize_correspondent`).
+   │     2. candidates.rank_candidates() (seit 2026-09-30, ohne LLM): Vorauswahl der
+   │        Ordner, in denen bereits Ähnliches liegt — aus Ordnernamen UND den Namen
+   │        der dort abgelegten Dateien (vom lokalen Mount gelesen). Verglichen werden
+   │        Absender, Titel, Stichworte, Dateiname/PDF-Titel; zusätzlich zählt, ob ein
+   │        Ordnername wörtlich im Dokumenttext vorkommt. Jahres-Unterordner ("2024")
+   │        werden ihrem Elternordner zugerechnet. Jeder Kandidat trägt eine
+   │        Beleg-Stärke und die Anzahl der Dateien desselben Absenders.
+   │        Grund: vorher sah das Modell nur OrdnerNAMEN und musste auf der Wurzelebene
+   │        raten, was in einem Ordner liegt — die Ursache der meisten echten
+   │        Fehlablagen (ein Versicherungsschreiben zu einem Fahrzeug landete im
+   │        allgemeinen Versicherungs-Ordner statt beim Fahrzeug, wo alle gleichartigen
+   │        Dokumente lagen; ein Schreiben eines Absenders ohne eigenen Ordner landete
+   │        in einer beliebigen Kategorie). Weil die Vorauswahl bei jedem Lauf aus dem
+   │        echten Baum entsteht, lernt sie aus jeder Korrektur von Hand.
+   │     3. _pick_folder(): EIN Ollama-Aufruf wählt unter den Kandidaten (je mit bis zu
+   │        drei Beispieldateien) und den Hauptordnern. Er ist ein Folge-Turn des
+   │        Extraktions-Gesprächs (gleiches Präfix → der Dokumenttext wird nicht erneut
+   │        ausgewertet, und die Entscheidung sieht Text UND Titel/Absender). Die
+   │        Antwort ist der ORDNERPFAD, per JSON-Schema auf die angebotenen Pfade
+   │        beschränkt — erfundene Ordner sind damit ausgeschlossen. Bewusst kein
+   │        Listen-Index: nach einer Nummer gefragt, hing die Wahl von der Reihenfolge
+   │        der Liste ab (bei 6 echten Dokumenten mit umgedrehter Liste 6-mal ein anderer
+   │        Ordner), mit ausgeschriebenem Pfad nur 1-mal.
+   │     4. Danach nur noch: Jahres-Unterordner anhand des (geprüften) Datums betreten
+   │        bzw. anlegen — ohne LLM. Wurde kein Kandidat, sondern nur ein Hauptordner
+   │        gewählt, folgt von dort der frühere Ebene-für-Ebene-Abstieg
+   │        (_walk_folder_tree: pro Ebene "descend"/"stay"/"new_folder", ungültige
+   │        Wahlen werden per Fuzzy-Match korrigiert oder gekappt).
+   │     5. Konfidenz aus dem Beleg statt aus der Selbstauskunft des Modells (die bei
+   │        richtigen wie falschen Antworten 0.9+ meldete): 0.9, wenn der gewählte
+   │        Ordner stark belegt ist oder dort bereits Dateien dieses Absenders liegen;
+   │        0.7 für einen neuen Unterordner in einem solchen Ordner; 0.5 ohne Beleg.
+   │        0.5 liegt unter dem Standard-`CONFIDENCE_THRESHOLD` (0.6): das Dokument geht
+   │        nach Unsortiert, der Vorschlag steht in der Logzeile ("Vorschlag: …"). Wird
+   │        es von Hand einsortiert, findet das nächste gleichartige Dokument es dort.
+   │        Wer auch unbelegte Vorschläge automatisch abgelegt haben will, setzt
+   │        `CONFIDENCE_THRESHOLD=0.5`.
+   │        Der Cloud-Pfad (`use_anthropic_classifier`) ersetzt die Schritte 2–5 durch
+   │        einen Anthropic-Aufruf mit der ganzen Ordnerliste und behält dessen eigene
+   │        Konfidenz; er ist von dieser Überarbeitung unberührt.
    │
    │        **Determinismus (2026-09-03):** beide Ollama-Aufrufe liefen mit
    │        `temperature=0.1` OHNE festen `seed` — ein Live-A/B-Test zeigte, dasselbe
@@ -185,10 +189,10 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │        Variation bei einer Aufgabe, bei der dasselbe Dokument immer gleich
    │        einsortiert werden soll.
    │
-   │        **Titel-Signale + Prompt-Aufbau (2026-09-30):** jeder Ordner-Schritt sieht
-   │        zusätzlich den extrahierten Absender/Titel, den Dateinamen und den
-   │        PDF-Titel. Der Dokumenttext steht als eigener erster Gesprächs-Turn VOR
-   │        der (pro Schritt wechselnden) Ebene, damit Ollama das ausgewertete Präfix
+   │        **Prompt-Aufbau (2026-09-30):** auch jeder Schritt des Ebenen-Abstiegs
+   │        sieht den extrahierten Absender/Titel, den Dateinamen und den PDF-Titel.
+   │        Der Dokumenttext steht als eigener erster Gesprächs-Turn VOR der (pro
+   │        Schritt wechselnden) Ebene, damit Ollama das ausgewertete Präfix
    │        wiederverwendet. Wichtig: Text und Ebene in EINER Nachricht ("Text zuerst")
    │        ließ das Modell bei 3 von 4 echten Dokumenten auf der Wurzelebene "stay"
    │        antworten — erst die Zwei-Turn-Form entschied wieder wie das alte Prompt.
@@ -298,11 +302,9 @@ strukturell. Umsetzung:
 - `naming.py`: `build_filename(..., correspondent=...)` stellt `"{Absender} - "` voran,
   wenn vorhanden; `MAX_FILENAME_LENGTH` (150 Zeichen) kappt das Ergebnis hart, als
   Sicherheitsnetz gegen ausufernde OCR-Titel bei tief verschachtelten Nextcloud-Pfaden.
-- `classifier.py`: der extrahierte Absender wird zusätzlich per Fuzzy-Match gegen
-  existierende Ordner-Leaf-Namen im GESAMTEN Baum abgeglichen (`
-  CORRESPONDENT_FOLDER_MATCH_THRESHOLD = 0.87`) und bestimmt bei einem Treffer den
-  Startpunkt des Ordner-Abstiegs — siehe Architektur-Diagramm oben für den realen Fall,
-  den das behebt, und die noch offene Grenze (kein Treffer = ungelöst).
+- `candidates.py`: der extrahierte Absender ist das stärkste Signal der Ordner-Vorauswahl
+  (Ordnername und Namen bereits abgelegter Dateien) — siehe Architektur-Diagramm oben. Der
+  frühere Sonderweg "Absender ≈ Ordnername → Abstieg dort beginnen" ist darin aufgegangen.
 
 ## Repo-Struktur
 
@@ -322,14 +324,15 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
     pipeline.py      # Verarbeitung pro Datei
     ocr.py           # Textebenen-Check, img2pdf/ocrmypdf-Wrapper, Qualitätscheck
     signals.py       # Dateiname/PDF-Metadaten/Datumsangaben auswerten (ohne LLM)
-    folder_index.py  # Ordnerbaum vom lokalen Mount lesen
+    folder_index.py  # Ordnerbaum samt Dateinamen vom lokalen Mount lesen
     webdav.py        # PROPFIND / MKCOL / PUT / GET / DELETE / MOVE, httpx-basiert
-    classifier.py    # Content-Extraktion + hierarchischer Ordner-Abstieg, Ollama-Aufrufe
-    naming.py        # Sanitizing, Datumsparsing, Kollisionen, Fuzzy-Ordner-Match
+    classifier.py    # Content-Extraktion + Ordner-Entscheidung, Ollama-/Anthropic-Aufrufe
+    candidates.py    # Ordner-Vorauswahl aus Ordner- und Dateinamen (ohne LLM)
+    naming.py        # Sanitizing, Dateiname bauen, Kollisionen, Absender-Normalisierung
     depotlog.py      # Dateilog-TXT-Writer, ein File pro Verarbeitungs-Event
     scan_config.py   # DEPOT Config.json (excluded_folders) lesen/anwenden
     state.py         # sqlite: Fehlversuche + Hashes bereits abgelegter Scans
-    models.py        # pydantic-Schemas (ContentExtraction, FolderStepDecision)
+    models.py        # pydantic-Schemas (ContentExtraction, FolderPick, FolderStepDecision)
   tests/
     conftest.py       # Fake-Nextcloud-WebDAV-Server für Tests
     test_*.py
@@ -363,7 +366,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
   transienter Fallback (zählt nicht zum permanenten Fehlerlimit, wird stattdessen
   automatisch requeued).
 - **WebDAV-Auth-Fehler:** Connectivity-Check beim Start, klarer Fehlschlag mit Log.
-- **Ordner-Kollisionen/Fast-Duplikate:** Fuzzy-Match auf jeder Abstiegs-Ebene gegen die
+- **Ordner-Kollisionen/Fast-Duplikate:** Fuzzy-Match eines vorgeschlagenen neuen Ordners gegen die
   echten Kinder dieser Ebene — bei hoher Ähnlichkeit wird automatisch dorthin umgeleitet
   (`AUTO-REDIRECTED`/`AUTO-KORRIGIERT` im Log) statt einen Beinahe-Duplikat-Ordner
   anzulegen oder in `Unsortiert` zu landen.
@@ -395,7 +398,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (195 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (234 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

@@ -850,3 +850,73 @@ def test_upload_recovers_when_a_listed_folder_has_disappeared(monkeypatch, tmp_p
     assert dest == "Dokumente/Gesundheit/a.pdf"
     assert "Dokumente/Gesundheit" in fake_server.collections
     assert fake_server.files[dest] == b"x"
+
+
+def test_classifier_gets_the_file_names_of_the_existing_folders(monkeypatch, tmp_path, client, fake_server):
+    """The candidate search judges a folder by what is already filed in it."""
+    mount = tmp_path / "mount"
+    inbox = mount / "Dokumente" / "Scan Eingang"
+    inbox.mkdir(parents=True)
+    (mount / "Dokumente" / "Gesundheit").mkdir()
+    (mount / "Dokumente" / "Gesundheit" / "2026-01-01 Gesundkasse - Bescheid.pdf").write_bytes(b"x")
+    (mount / "Dokumente" / "Unsortiert").mkdir()
+    (mount / "Dokumente" / "Unsortiert" / "liegt zur Durchsicht.pdf").write_bytes(b"x")
+
+    p = _make_pipeline(
+        tmp_path, client,
+        scan_eingang_local_path=str(inbox), scan_eingang_webdav_path="Dokumente/Scan Eingang",
+    )
+    scan = inbox / "scan1.pdf"
+    scan.write_bytes(b"%PDF-raw-scan")
+    _seed_source_on_server(p, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+    calls = []
+
+    def fake_classify(**kwargs):
+        calls.append(kwargs)
+        return (
+            ClassificationOutcome(folder="Dokumente/Gesundheit", is_new_folder=False, title="Doc", confidence=0.9),
+            [],
+        )
+
+    monkeypatch.setattr(classifier, "classify", fake_classify)
+
+    p.process_one(scan)
+
+    # excluded folders (inbox, review folder) are not part of the index either
+    assert calls[0]["folder_files"] == {"Dokumente/Gesundheit": ["2026-01-01 Gesundkasse - Bescheid.pdf"]}
+    assert callable(calls[0]["resolve_date"])
+    p.state.close()
+
+
+def test_unsorted_document_keeps_the_suggested_folder_in_its_log_line(
+    monkeypatch, tmp_path, pipeline, fake_server, client
+):
+    """Not sure enough to file - but the best guess must not be lost."""
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **kwargs: (
+            ClassificationOutcome(folder="Dokumente/IT Sachen", is_new_folder=False, title="Lizenz", confidence=0.5),
+            ["OHNE-KANDIDAT"],
+        ),
+    )
+
+    pipeline.process_one(scan)
+
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Unsortiert/")]) == 1
+    assert not any(p.startswith("Dokumente/IT Sachen/") for p in fake_server.files)
+    log_text = _get_log_text(fake_server, client)
+    assert "Vorschlag: Dokumente/IT Sachen" in log_text
+    assert log_text.rstrip().endswith(".pdf")  # the real destination stays last on the line
+

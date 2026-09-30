@@ -197,3 +197,25 @@ def test_content_date_more_than_a_few_days_ahead_is_discarded():
         {"title": "Wahlbenachrichtigung", "correspondent": "", "issue_date": soon, "confidence": 0.9}
     )
     assert result.issue_date is None
+
+
+# ---- FolderPick ------------------------------------------------------------------
+
+def test_folder_pick_parses_and_normalizes():
+    from depot.models import FolderPick
+
+    pick = FolderPick.model_validate(
+        {"folder": " Dokumente/Auto/ ", "new_folder_name": "  Schaden 2026/ ", "confidence": 90}
+    )
+    assert (pick.folder, pick.new_folder_name, pick.confidence) == ("Dokumente/Auto", "Schaden 2026", 0.9)
+    blank = FolderPick.model_validate({"folder": "Dokumente", "new_folder_name": "  ", "confidence": 0.5})
+    assert blank.new_folder_name is None
+
+
+def test_folder_pick_rejects_a_missing_or_empty_folder():
+    from depot.models import FolderPick
+
+    with pytest.raises(ValidationError):
+        FolderPick.model_validate({"confidence": 0.5})
+    with pytest.raises(ValidationError):
+        FolderPick.model_validate({"folder": "", "confidence": 0.5})

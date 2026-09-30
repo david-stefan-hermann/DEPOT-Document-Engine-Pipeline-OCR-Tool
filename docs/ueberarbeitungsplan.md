@@ -1,7 +1,7 @@
 # DEPOT — Überarbeitungsplan: bessere Zuordnung, schnellere Verarbeitung
 
-Stand: 2026-09-30. Status: **Phase 0 und 1 umgesetzt (plus Duplikat-Erkennung), Phase 2–4
-offen** — siehe Abschnitt 5a für Ergebnis und Messwerte. Ergänzt [plan.md](plan.md)
+Stand: 2026-09-30. Status: **Phase 0, 1 und 2 umgesetzt (plus Duplikat-Erkennung), Phase 3–4
+offen** — Ergebnisse und Messwerte in den Abschnitten 5a (Phase 1) und 5b (Phase 2). Ergänzt [plan.md](plan.md)
 (Architektur-Ist-Stand) um eine priorisierte Überarbeitung. Grundlage sind nicht Vermutungen,
 sondern (a) der komplette Code, (b) die 31 echten Dateilog-Einträge aus dem Produktivbetrieb,
 (c) die tatsächlich abgelegten PDFs und (d) Live-Messungen gegen den echten Ollama-Server
@@ -273,6 +273,83 @@ zeigt jetzt `ocr=… llm=… dav=…`.
 - **Abnahme:** Eval auf größerer Stichprobe (≥ 100 Dokumente, Leave-one-out) — exakter Ordner
   und "falsch bei hoher Konfidenz" klar besser als der Stand aus 5a (43 % / 40 %); der bekannte
   Fall "Absender ohne eigenen Ordner" landet lokal richtig; LLM-Zeit ≈ 10–12 s pro Dokument.
+  Ergebnis siehe 5b.
+
+### 5b. Stand nach Phase 2 (2026-09-30)
+
+**So läuft die Ordner-Entscheidung jetzt** (lokaler Pfad; Details in [plan.md](plan.md)):
+Extraktion → Vorauswahl ohne LLM aus Ordnernamen und den Namen der dort abgelegten Dateien
+(`candidates.py`) → ein LLM-Aufruf wählt unter den Kandidaten (mit Beispieldateien) und den
+Hauptordnern → Jahres-Unterordner folgen aus dem Datum → Konfidenz aus dem Beleg.
+
+Umsetzung der Planpunkte und Abweichungen:
+
+- **2.1 Ordner-Index** — umgesetzt (`folder_index.scan_local_tree`, `candidates.py`).
+- **2.2 Absender normalisieren** — umgesetzt (Rechtsform/Adresse entfernen, an die bereits
+  verwendete Schreibweise angleichen). Neue Dateinamen tragen den Absender ohne "GmbH"/"AG".
+- **2.3 Kandidaten + Einzelentscheidung** — umgesetzt, mit zwei Änderungen aus der Messung:
+  - Die Antwort ist der **Ordnerpfad**, nicht die Nummer in der Liste. Nach einer Nummer gefragt,
+    hing die Wahl von der Reihenfolge der Liste ab: bei 6 echten Dokumenten ergab die umgedrehte
+    Liste 6-mal einen anderen Ordner; mit ausgeschriebenem (per Schema auf die Liste
+    beschränktem) Pfad nur 1-mal.
+  - Der Ebene-für-Ebene-Abstieg bleibt als Rückfall, wenn kein Kandidat, sondern nur ein
+    Hauptordner gewählt wird. Nach einem gewählten Kandidaten steigt das Modell NICHT weiter
+    ab — im ersten Versuch führte genau das von einem richtig gewählten Ordner in einen
+    unpassenden, sehr speziellen Unterordner.
+- **2.4 Gemeinsames Prompt-Präfix** — für die Entscheidung umgesetzt (Folge-Turn des
+  Extraktions-Gesprächs). Das Extraktions-Prompt selbst ist unverändert und nicht gekürzt:
+  dieses Eval misst nur die Ordnerwahl, eine Verschlechterung bei Titel/Datum wäre unbemerkt
+  geblieben.
+- **2.5 Konfidenz aus Signalen** — umgesetzt, einfacher als geplant: 0.9 belegt / 0.7 neuer
+  Unterordner in belegtem Ordner / 0.5 unbelegt. "Belegt" heißt: Beleg-Stärke ≥ 5 oder im
+  gewählten Ordner liegen bereits Dateien dieses Absenders. Die Selbstauskunft des Modells
+  zählt nicht mehr. Unbelegte Entscheidungen gehen mit `Vorschlag: <Ordner>` in der Logzeile
+  nach `Unsortiert`; mit `CONFIDENCE_THRESHOLD=0.5` würden auch sie einsortiert.
+- **2.6 Cloud-Pfad** — bewusst unverändert (nur Absender-Normalisierung und Datumsprüfung
+  wirken auch dort). Er ist mit diesem Eval nicht gemessen: das würde Dokumenttitel an
+  Anthropic senden und API-Kosten verursachen.
+
+**Messung — 120 von Hand einsortierte PDFs aus dem echten Baum** (165 Kandidaten-Ordner,
+neutraler Dateiname `scan.pdf`, Leave-one-out, dieselben Dokumente für beide Stände):
+
+| Kennzahl | Phase 1 | Phase 2 |
+|---|---|---|
+| exakter Ordner | 47 (39 %) | **60 (50 %)** |
+| eine Ebene daneben | 8 | 4 |
+| `Unsortiert` | 7 (6 %) | 41 (34 %) |
+| **falsch einsortiert** | **58 (48 %)** | **15 (12 %)** |
+
+(Der ursprüngliche Stand vor Phase 1 wurde nur auf den ersten 30 dieser Dokumente gemessen:
+6 exakt, 21 falsch einsortiert.)
+
+Einordnung:
+
+- Von den 79 Dokumenten, die Phase 2 einsortiert, liegen 65 exakt oder eine Ebene daneben.
+  Von den 15 falsch einsortierten sind 9 Kopien von Gehaltsabrechnungen, die im Baum bewusst
+  als Nachweis in einem themenfremden Ordner liegen — die "falsche" Ablage beim Arbeitgeber
+  ist dort die naheliegende. Ohne diese 9 sind es 6 Fehler bei 70 Ablagen; 3 davon treffen
+  einen Geschwisterordner im richtigen Zweig.
+- Der Preis: ein Drittel geht nach `Unsortiert`. Dort wäre der Vorschlag in 16 von 41 Fällen
+  exakt richtig gewesen — zu wenig, um blind abzulegen. Der Testsatz enthält dabei viel, was
+  keine typische Post ist (Handbücher, Lebensläufe, englische Anleitungen, Rechnungen von
+  Einmal-Händlern); für wiederkehrende Absender ist der Anteil kleiner.
+- Die Vorauswahl allein: der richtige Ordner (Jahresordner dem Elternordner zugerechnet) steht
+  bei 60 % an erster Stelle und bei 82 % unter den ersten acht.
+- Zeit: LLM-Anteil im realistischen Lauf ohne Cache 11,6 s pro Dokument (8–14,5 s; 25 andere
+  Dokumente), gegenüber 14,3 s nach Phase 1.
+
+**Bekannte Grenzen nach Phase 2:**
+
+- Rein lexikalisch: "Curriculum Vitae" findet den Ordner "Lebenslauf" nicht, ein englisches
+  Handbuch nicht den Ordner "Manuals". Das wäre der Nutzen eines Embedding-Modells (Phase 4).
+- Geschwisterordner, die sich nur durch einen Vorgang unterscheiden (mehrere
+  Änderungs-Ordner derselben Versicherung, zwei Fahrzeuge desselben Typs), kann auch die
+  Vorauswahl nicht sicher trennen.
+- Ein Absender, der viele verschiedene Dinge liefert (Marktplatz-Rechnungen), zählt als
+  "bekannt", sobald eine Rechnung von ihm irgendwo liegt — im Testsatz 1 Fehlablage dadurch.
+- Ohne lokalen Mount (nur WebDAV) kennt die Vorauswahl nur Ordnernamen; dann ist deutlich
+  weniger belegt und es geht mehr nach `Unsortiert`.
+- Der eigene Name des Nutzers in Titel und Dateinamen erzeugt gelegentlich Zufallstreffer.
 
 ### Phase 3 — Durchsatz und Robustheit
 
@@ -292,7 +369,9 @@ zeigt jetzt `ocr=… llm=… dav=…`.
 ### Phase 4 — Optional, nur wenn die Eval-Zahlen es rechtfertigen
 
 - Embedding-Modell über Ollama für die Kandidatensuche (semantisch statt Wort-Überlappung);
-  VRAM-Konkurrenz mit dem 4,7-GB-Modell auf der 6-GB-Karte beachten.
+  VRAM-Konkurrenz mit dem Modell (4,99 GB bei `num_ctx=8192`) auf der 6-GB-Karte beachten.
+  Laut 5b der naheliegendste nächste Schritt für die Zuordnung: er zielt auf die Fälle, die
+  heute mangels Wort-Überlappung in `Unsortiert` landen.
 - Modellwechsel — erstmals objektiv vergleichbar über `tools/eval.py` statt über Einzelfälle.
 
 ## 6. Erwartete Wirkung

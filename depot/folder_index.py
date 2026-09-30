@@ -18,17 +18,25 @@ def local_mount_root(scan_eingang_local_path: str, scan_eingang_webdav_path: str
     return Path(local[: -len(suffix)] or "/")
 
 
-def list_local_folders(mount_root: Path, webdav_root: str) -> list[str] | None:
-    """WebDAV-relative paths of every subfolder under `webdav_root` (itself
-    excluded) - the same result as WebDavClient.list_folders_recursive, from
-    one local directory walk. None if that folder isn't there locally."""
+def scan_local_tree(mount_root: Path, webdav_root: str) -> dict[str, list[str]] | None:
+    """Every subfolder under `webdav_root` (itself excluded) as a
+    WebDAV-relative path, mapped to the names of the files directly inside
+    it - from one local directory walk. None if that folder isn't there
+    locally."""
     webdav_root = webdav_root.strip("/")
     start = mount_root / webdav_root
     if not start.is_dir():
         return None
-    result: list[str] = []
-    for current, dirnames, _ in os.walk(start):
+    result: dict[str, list[str]] = {}
+    for current, _, filenames in os.walk(start):
         rel = Path(current).relative_to(start).as_posix()
-        base = webdav_root if rel == "." else f"{webdav_root}/{rel}"
-        result.extend(f"{base}/{name}" for name in dirnames)
+        if rel != ".":
+            result[f"{webdav_root}/{rel}"] = sorted(filenames)
     return result
+
+
+def list_local_folders(mount_root: Path, webdav_root: str) -> list[str] | None:
+    """WebDAV-relative paths of every subfolder under `webdav_root` - the
+    same result as WebDavClient.list_folders_recursive."""
+    tree = scan_local_tree(mount_root, webdav_root)
+    return None if tree is None else list(tree)

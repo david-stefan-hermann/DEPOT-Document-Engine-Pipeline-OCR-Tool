@@ -126,6 +126,37 @@ class FolderStepDecision(BaseModel):
         return v.strip().strip("/") if v else None
 
 
+class FolderPick(BaseModel):
+    """The one decision among a shortlist of folders. `folder` is restricted
+    to the offered paths in the schema handed to the model.
+
+    Deliberately the path itself, not its number in the list: asked for a
+    number, the model's answer depended on the order of the list (with the
+    list reversed the same document went to a different folder in 6 of 6
+    real cases); writing out the path, it chose the same folder either way
+    in 5 of 6."""
+
+    folder: str = Field(min_length=1)
+    # Set only to create a new subfolder under the chosen folder.
+    new_folder_name: str | None = None
+    confidence: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def _normalize_confidence(cls, v: float | int) -> float:
+        return _normalize_confidence_value(v)
+
+    @field_validator("folder")
+    @classmethod
+    def _strip_folder(cls, v: str) -> str:
+        return v.strip().strip("/")
+
+    @field_validator("new_folder_name")
+    @classmethod
+    def _strip_new_folder_name(cls, v: str | None) -> str | None:
+        return v.strip().strip("/") or None if v else None
+
+
 class AnthropicFolderDecision(BaseModel):
     """A single-shot filing decision from the cloud (Anthropic) classifier,
     given the whole existing folder tree at once rather than one level at a

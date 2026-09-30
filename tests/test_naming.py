@@ -107,3 +107,38 @@ def test_duplicate_filename_marks_the_first_copys_name():
     assert naming.duplicate_filename("2026-09-29 ROLAND - Antrag.pdf", ".pdf") == "2026-09-29 ROLAND - Antrag (Duplikat).pdf"
     # the duplicate is stored as the raw scan, so it keeps its own extension
     assert naming.duplicate_filename("2026-09-29 Foto.pdf", "jpg") == "2026-09-29 Foto (Duplikat).jpg"
+
+
+# ---- correspondent normalization ------------------------------------------------
+
+def test_strip_legal_form_and_address():
+    assert naming.strip_legal_form("Stadtwerke Musterstadt Servicegesellschaft mbH") == "Stadtwerke Musterstadt Servicegesellschaft"
+    assert naming.strip_legal_form("Muster GmbH & Co. KG") == "Muster"
+    assert naming.strip_legal_form("Bezirkswahlamt Musterbezirk, 12345 Berlin") == "Bezirkswahlamt Musterbezirk"
+    assert naming.strip_legal_form("Sportverein Beispiel e.V.") == "Sportverein Beispiel"
+    assert naming.strip_legal_form("Finanzamt") == "Finanzamt"
+
+
+def test_strip_legal_form_leaves_names_that_only_look_like_one():
+    # "AG" at the start is a court (Amtsgericht), not a stock corporation
+    assert naming.strip_legal_form("AG Charlottenburg") == "AG Charlottenburg"
+    # part of a hyphenated name, not a separate word
+    assert naming.strip_legal_form("Beispiel Rechtsschutz-Versicherungs-AG") == "Beispiel Rechtsschutz-Versicherungs-AG"
+
+
+def test_known_correspondents_come_from_depots_own_filenames():
+    files = {
+        "Dokumente/A": [
+            "2026-01-01 Gesundkasse - Bescheid.pdf", "2026-02-01 Gesundkasse - Rechnung.pdf", "irgendwas.pdf",
+        ],
+        "Dokumente/B": ["2026-03-01 Muster GmbH - Abrechnung.pdf", "2026-03-02 Nur ein Titel.pdf"],
+    }
+    assert naming.known_correspondents(files) == ["Gesundkasse", "Muster"]
+
+
+def test_normalize_correspondent_takes_the_spelling_already_in_use():
+    known = ["Techniker Krankenkasse", "Muster"]
+    assert naming.normalize_correspondent("Techniker Krankenkase", known) == "Techniker Krankenkasse"
+    assert naming.normalize_correspondent("Muster GmbH", known) == "Muster"
+    assert naming.normalize_correspondent("Ganz Anderer Absender AG", known) == "Ganz Anderer Absender"
+    assert naming.normalize_correspondent("", known) == ""

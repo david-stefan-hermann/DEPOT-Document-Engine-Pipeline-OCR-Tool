@@ -72,6 +72,10 @@ class Pipeline:
         self._folder_cache: list[str] | None = None
         self._folder_cache_time: float = 0.0
         self._folder_cache_ttl: float = FOLDER_CACHE_TTL_SECONDS
+        # Names of the files in each cached folder - what the candidate
+        # search reads "what is this folder for" from. None when the tree
+        # can only be listed via WebDAV (folder names only).
+        self._folder_files: dict[str, list[str]] | None = None
         self._folder_cache_lock = threading.Lock()
         # Every folder known to exist on the server (unfiltered, unlike
         # _folder_cache) - lets uploads skip the per-path-segment existence
@@ -90,7 +94,7 @@ class Pipeline:
             now = time.monotonic()
             stale = self._folder_cache is None or (now - self._folder_cache_time) > self._folder_cache_ttl
             if stale:
-                folders, self._folder_cache_ttl = self._list_all_folders()
+                folders, folder_files, self._folder_cache_ttl = self._list_all_folders()
                 self._known_folders = set(folders)
                 excluded = scan_config.load_excluded_folders(
                     self.config.scan_eingang_local_path,
@@ -114,19 +118,30 @@ class Pipeline:
                 #   defeating the point of a review bucket.
                 excluded = [*excluded, self.config.scan_eingang_webdav_path, self.config.fallback_folder]
                 self._folder_cache = scan_config.filter_excluded(folders, excluded)
+                self._folder_files = (
+                    None if folder_files is None
+                    else {f: folder_files.get(f, []) for f in self._folder_cache}
+                )
                 self._folder_cache_time = now
             return list(self._folder_cache)
 
-    def _list_all_folders(self) -> tuple[list[str], float]:
-        """Every folder under Dokumente/ plus how long that listing may be
-        cached: from the local mount when it covers the tree, otherwise via
-        WebDAV as before."""
+    def _get_folder_files(self) -> dict[str, list[str]] | None:
+        """File names per folder, as of the listing _get_existing_folders()
+        last returned."""
+        with self._folder_cache_lock:
+            return self._folder_files
+
+    def _list_all_folders(self) -> tuple[list[str], dict[str, list[str]] | None, float]:
+        """Every folder under Dokumente/, the file names in each (if known)
+        and how long that listing may be cached: from the local mount when
+        it covers the tree, otherwise via WebDAV as before (folders only)."""
         if self._mount_root is not None:
-            folders = folder_index.list_local_folders(self._mount_root, self.config.dokumente_webdav_root)
-            if folders is not None:
-                return folders, LOCAL_FOLDER_CACHE_TTL_SECONDS
+            tree = folder_index.scan_local_tree(self._mount_root, self.config.dokumente_webdav_root)
+            if tree is not None:
+                return list(tree), tree, LOCAL_FOLDER_CACHE_TTL_SECONDS
         return (
             self.webdav.list_folders_recursive(self.config.dokumente_webdav_root),
+            None,
             FOLDER_CACHE_TTL_SECONDS,
         )
 
@@ -343,6 +358,18 @@ class Pipeline:
         tags: list[str] = []
         target_folder: str | None = None
         model_date: date | None = None
+        suggestion: str | None = None
+
+        def resolve_date(candidate: date | None) -> tuple[date | None, str | None]:
+            return signals.resolve_issue_date(
+                candidate,
+                ocr_result.text,
+                name_signals,
+                # Only a born-digital PDF's creation date says when the
+                # document was issued; for a scan it is just the scan time.
+                pdf_created if ocr_result.born_digital else None,
+                today,
+            )
 
         # No text, but the user gave the file a real name: that name is the
         # document's title, and is enough to file it by. (Previously every
@@ -375,13 +402,16 @@ class Pipeline:
                 dokumente_root=cfg.dokumente_webdav_root,
                 content=content,
                 pdf_title=pdf_title,
+                filename_title=name_signals.title,
+                folder_files=self._get_folder_files(),
+                # The folder decision needs the date too (year subfolders).
+                resolve_date=lambda candidate: resolve_date(candidate)[0],
             )
             if use_anthropic_classifier:
                 result, classifier_tags = classifier.classify_via_anthropic(
                     **classify_args,
                     anthropic_api_key=cfg.anthropic_api_key,
                     anthropic_model=cfg.anthropic_model,
-                    filename_title=name_signals.title,
                 )
             else:
                 result, classifier_tags = classifier.classify(**classify_args)
@@ -394,6 +424,9 @@ class Pipeline:
             if confidence < cfg.confidence_threshold:
                 target_folder = cfg.fallback_folder
                 tags.append(depotlog.TAG_UNSORTED)
+                # Not sure enough to file it there - but worth telling.
+                if result.folder != cfg.dokumente_webdav_root:
+                    suggestion = result.folder
             else:
                 target_folder = result.folder
                 if result.is_new_folder:
@@ -409,20 +442,12 @@ class Pipeline:
                 )
             confidence = content.confidence
             title = content.title
-            correspondent = content.correspondent
+            correspondent = naming.normalize_correspondent(content.correspondent)
             model_date = content.issue_date
             tags.append(depotlog.TAG_FILING_DISABLED)
         llm_seconds = time.perf_counter() - started
 
-        issue_date, date_source = signals.resolve_issue_date(
-            model_date,
-            ocr_result.text,
-            name_signals,
-            # Only a born-digital PDF's creation date says when the document
-            # was issued; for a scan it is just the scan time.
-            pdf_created if ocr_result.born_digital else None,
-            today,
-        )
+        issue_date, date_source = resolve_date(model_date)
         if issue_date is None:
             tags.append(depotlog.TAG_DATE_UNCERTAIN)
         elif date_source == "filename":
@@ -469,6 +494,8 @@ class Pipeline:
             f"confidence={confidence:.2f} | "
             f"ocr={ocr_seconds:.1f}s llm={llm_seconds:.1f}s dav={dav_seconds:.1f}s"
         )
+        if suggestion:
+            message += f" | Vorschlag: {suggestion}"
         if dest_rel and processed_rel:
             message += f" | Kopie: {processed_rel}"
         log_path = dest_rel or processed_rel

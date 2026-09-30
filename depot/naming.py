@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import difflib
+import re
 import unicodedata
+from collections import Counter
 from datetime import date
 
 from pathvalidate import sanitize_filename
@@ -39,6 +41,60 @@ def sanitize_correspondent(correspondent: str | None) -> str:
         return ""
     cleaned = sanitize_title(correspondent)
     return "" if cleaned == "Dokument" else cleaned
+
+
+# Legal forms as separate words after the actual name ("Stadtwerke Muenchen
+# GmbH", "Muster GmbH & Co. KG"). Case-sensitive on purpose, and never at the
+# very start: "AG Charlottenburg" is a court, not a stock corporation.
+_LEGAL_FORM = re.compile(
+    r"(?<=\S)[\s,]+(?:&\s*Co\.?\s*)?"
+    r"(?:gGmbH|GmbH|mbH|AG|KGaA|KG|OHG|UG|SE|GbR|eG|e\.\s?V\.|Ltd\.?|Inc\.?)"
+    r"(?:\s*&\s*Co\.?)?(?=$|[\s,])"
+)
+_TRAILING_ADDRESS = re.compile(r",\s*(?:[^,]*,\s*)?\d{5}\s+\S.*$")
+_FILED_NAME = re.compile(r"^\d{4}-\d{2}-\d{2} (.+?) - .+")
+
+# Above this similarity a sender counts as one already seen, and takes that
+# spelling - "one sender, one name" across all filed documents.
+KNOWN_CORRESPONDENT_THRESHOLD = 0.9
+
+
+def strip_legal_form(correspondent: str) -> str:
+    """"Stadtwerke Muenchen GmbH, 80331 Muenchen" -> "Stadtwerke Muenchen"."""
+    name = _TRAILING_ADDRESS.sub("", normalize(correspondent))
+    previous = None
+    while previous != name:
+        previous = name
+        name = _LEGAL_FORM.sub("", name)
+    return " ".join(name.split()).strip(" ,;-")
+
+
+def known_correspondents(folder_files: dict[str, list[str]]) -> list[str]:
+    """Senders of already filed documents, read off DEPOT's own filename
+    scheme ("YYYY-MM-DD Absender - Titel"), most frequent first."""
+    counts: Counter[str] = Counter()
+    for filenames in folder_files.values():
+        for filename in filenames:
+            match = _FILED_NAME.match(filename)
+            if match:
+                name = strip_legal_form(match[1])
+                if name:
+                    counts[name] += 1
+    return [name for name, _ in counts.most_common()]
+
+
+def normalize_correspondent(correspondent: str, known: list[str] | None = None) -> str:
+    """The sender without legal form/address, in the spelling already used
+    for that sender if there is one."""
+    name = strip_legal_form(correspondent)
+    if not name:
+        return ""
+    best: tuple[float, str] | None = None
+    for candidate in known or []:
+        ratio = folder_similarity(name, candidate)
+        if ratio >= KNOWN_CORRESPONDENT_THRESHOLD and (best is None or ratio > best[0]):
+            best = (ratio, candidate)
+    return best[1] if best else name
 
 
 def build_filename(
