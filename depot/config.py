@@ -54,6 +54,13 @@ class Config:
     # storages, shares), so the listing falls back to WebDAV.
     use_local_folder_listing: bool = True
 
+    # How often the inbox is re-scanned for files that are still lying
+    # there (missed events, given-up transient retries). 0 disables it.
+    sweep_interval_seconds: float = 600.0
+    # Where OCR results wait until their scan is filed (survives restarts).
+    # None: next to the state DB.
+    ocr_cache_dir: str | None = None
+
     @classmethod
     def from_env(cls) -> "Config":
         # Resolved ahead of the other defaults below since ERROR_FOLDER's own
@@ -104,4 +111,6 @@ class Config:
             ),
             use_local_folder_listing=os.environ.get("USE_LOCAL_FOLDER_LISTING", "true").strip().lower()
             not in ("0", "false", "no", "off"),
+            sweep_interval_seconds=float(os.environ.get("SWEEP_INTERVAL_SECONDS", "600")),
+            ocr_cache_dir=os.environ.get("OCR_CACHE_DIR") or None,
         )

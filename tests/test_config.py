@@ -24,6 +24,20 @@ def test_from_env_defaults(monkeypatch, tmp_path):
     assert config.error_folder == "Dokumente/Scan Eingang/Depot Config/_Fehlerhaft"
     assert config.anthropic_api_key is None
     assert config.anthropic_model == "claude-haiku-4-5"
+    monkeypatch.delenv("SWEEP_INTERVAL_SECONDS", raising=False)
+    monkeypatch.delenv("OCR_CACHE_DIR", raising=False)
+    config = Config.from_env()
+    assert config.sweep_interval_seconds == 600.0
+    assert config.ocr_cache_dir is None  # the pipeline puts it next to the state DB
+
+
+def test_from_env_reads_sweep_interval_and_ocr_cache_dir(monkeypatch, tmp_path):
+    _set_required_env(monkeypatch, tmp_path)
+    monkeypatch.setenv("SWEEP_INTERVAL_SECONDS", "0")
+    monkeypatch.setenv("OCR_CACHE_DIR", "/scratch/cache")
+    config = Config.from_env()
+    assert config.sweep_interval_seconds == 0.0
+    assert config.ocr_cache_dir == "/scratch/cache"
 
 
 def test_from_env_reads_anthropic_api_key(monkeypatch, tmp_path):

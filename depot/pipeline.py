@@ -5,17 +5,20 @@ import logging
 import queue
 import threading
 import time
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
+from typing import Callable
 
 import httpx
 
 from depot import classifier, depotlog, folder_index, naming, ocr, scan_config, signals
 from depot.config import Config
 from depot.depotlog import DepotLog
-from depot.models import ContentExtraction
+from depot.models import ContentExtraction, OcrResult
+from depot.ocr_cache import OcrCache
 from depot.state import StateStore
-from depot.webdav import WebDavClient
+from depot.webdav import PreconditionFailed, WebDavClient
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +32,8 @@ TRANSIENT_EXCEPTIONS = (
 
 # In-memory only (deliberately not persisted): how many times a transient
 # infra failure (Ollama/WebDAV unreachable) has been retried for a given
-# file in this process's lifetime.
+# file in this process's lifetime. Once these are used up the file simply
+# stays in the inbox until the periodic sweep queues it again.
 _TRANSIENT_RETRY_DELAY_SECONDS = 30.0
 MAX_TRANSIENT_RETRIES = 5
 
@@ -49,7 +53,38 @@ LOCAL_FOLDER_CACHE_TTL_SECONDS = 15.0
 FILENAME_ONLY_CONFIDENCE = 0.7
 
 
+@dataclass
+class PreparedDocument:
+    """What the OCR stage hands to the LLM stage for one scan: everything
+    that could be learned about the file without the model."""
+
+    path: Path
+    content_hash: str
+    ocr_result: OcrResult
+    ocr_seconds: float
+    name_signals: signals.FilenameSignals
+    pdf_title: str | None
+    pdf_created: date | None
+    file_into_dokumente: bool
+    save_processed_copy: bool
+    use_anthropic_classifier: bool
+
+
 class Pipeline:
+    """Two stages, so the CPU and the GPU work at the same time:
+
+    1. OCR stage (`max_concurrent_jobs` threads): duplicate check, filename
+       and PDF-metadata signals, OCR. Its result is kept in the OCR cache
+       until the scan is filed, so a retry never repeats the OCR.
+    2. LLM stage (exactly one thread): classification, filename, upload,
+       deletion of the source scan. One thread because the model holds one
+       document's context at a time - a second one would evict the first
+       from Ollama's prompt cache.
+
+    While document n is being classified, document n+1 is already being
+    recognized.
+    """
+
     def __init__(
         self,
         config: Config,
@@ -67,6 +102,9 @@ class Pipeline:
             self.webdav, config.scan_eingang_webdav_path, config.log_file_prefix, config.config_subfolder
         )
         self.state = state or StateStore(config.state_db_path)
+        cache_dir = config.ocr_cache_dir or str(Path(config.state_db_path).parent / "ocr-cache")
+        self.ocr_cache = OcrCache(cache_dir)
+        self.ocr_cache.prune()
         self._transient_retries: dict[str, int] = {}
         self._transient_lock = threading.Lock()
         self._folder_cache: list[str] | None = None
@@ -86,6 +124,8 @@ class Pipeline:
             if config.use_local_folder_listing
             else None
         )
+        # Files somewhere between "taken from the queue" and "filed or
+        # failed" - in either stage or waiting between them.
         self._in_flight: set[str] = set()
         self._in_flight_lock = threading.Lock()
 
@@ -156,27 +196,52 @@ class Pipeline:
         self.webdav.close()
         self.state.close()
 
+    # ---- workers -----------------------------------------------------------
+
     def run_workers(self, in_queue: "queue.Queue[Path]") -> list[threading.Thread]:
+        """Start the OCR threads (`max_concurrent_jobs`) and the single LLM
+        thread; see the class docstring."""
+        llm_queue: "queue.Queue[PreparedDocument]" = queue.Queue()
         workers = []
         for i in range(max(1, self.config.max_concurrent_jobs)):
             t = threading.Thread(
-                target=self._worker_loop, args=(in_queue,), daemon=True, name=f"depot-worker-{i}"
+                target=self._ocr_loop, args=(in_queue, llm_queue), daemon=True, name=f"depot-ocr-{i}"
             )
             t.start()
             workers.append(t)
+        t = threading.Thread(target=self._llm_loop, args=(llm_queue, in_queue), daemon=True, name="depot-llm")
+        t.start()
+        workers.append(t)
         return workers
 
-    def _worker_loop(self, in_queue: "queue.Queue[Path]") -> None:
+    def _ocr_loop(self, in_queue: "queue.Queue[Path]", llm_queue: "queue.Queue[PreparedDocument]") -> None:
         while True:
             path = in_queue.get()
             try:
-                self.process_one(path, in_queue)
+                self.process_one(path, in_queue, hand_off=llm_queue.put)
             except Exception:
                 log.exception("Unhandled error processing %s", path)
             finally:
                 in_queue.task_done()
 
-    def process_one(self, path: Path, requeue: "queue.Queue[Path] | None" = None) -> None:
+    def _llm_loop(self, llm_queue: "queue.Queue[PreparedDocument]", requeue: "queue.Queue[Path]") -> None:
+        while True:
+            prepared = llm_queue.get()
+            try:
+                self._finish_guarded(prepared, requeue)
+            except Exception:
+                log.exception("Unhandled error finishing %s", prepared.path)
+            finally:
+                llm_queue.task_done()
+
+    def process_one(
+        self,
+        path: Path,
+        requeue: "queue.Queue[Path] | None" = None,
+        hand_off: "Callable[[PreparedDocument], None] | None" = None,
+    ) -> None:
+        """Run the OCR stage for one scan and then either hand the result to
+        the LLM stage (`hand_off`) or, without one, finish it right here."""
         original_name = path.name
         # The watcher can report one file twice (created + moved, or sweep +
         # event). Seen in production: the second run started a second after
@@ -187,6 +252,7 @@ class Pipeline:
                 log.info("Skipping %s: already being processed.", original_name)
                 return
             self._in_flight.add(original_name)
+        handed_off = False
         try:
             if not path.exists():
                 log.info("Skipping %s: no longer in the scan inbox.", original_name)
@@ -194,17 +260,53 @@ class Pipeline:
             log.info("Processing %s", original_name)
 
             try:
-                self._process(path)
-                self.state.reset(original_name)
-                with self._transient_lock:
-                    self._transient_retries.pop(original_name, None)
+                prepared = self._prepare(path)
             except TRANSIENT_EXCEPTIONS as exc:
                 self._handle_transient_failure(path, requeue, exc)
+                return
             except Exception as exc:
                 self._handle_permanent_failure(path, exc)
+                return
+            if prepared is None:  # a duplicate - filed as such, nothing left to do
+                self._mark_done(original_name)
+            elif hand_off is not None:
+                hand_off(prepared)
+                handed_off = True
+            else:
+                self._finish_guarded(prepared, requeue)
         finally:
-            with self._in_flight_lock:
-                self._in_flight.discard(original_name)
+            if not handed_off:
+                self._release(original_name)
+
+    def _finish_guarded(self, prepared: PreparedDocument, requeue: "queue.Queue[Path] | None") -> None:
+        """The LLM stage for one prepared scan, with the same failure
+        handling as the OCR stage. A transient failure sends the path back
+        to the start of the queue - where the OCR cache makes the first
+        stage nearly free."""
+        path = prepared.path
+        try:
+            if not path.exists():
+                # Taken out of the inbox by hand while it waited its turn.
+                log.info("Skipping %s: removed from the scan inbox while waiting.", path.name)
+                self.ocr_cache.discard(prepared.content_hash)
+                return
+            self._finish(prepared)
+            self._mark_done(path.name)
+        except TRANSIENT_EXCEPTIONS as exc:
+            self._handle_transient_failure(path, requeue, exc)
+        except Exception as exc:
+            self._handle_permanent_failure(path, exc)
+        finally:
+            self._release(path.name)
+
+    def _release(self, original_name: str) -> None:
+        with self._in_flight_lock:
+            self._in_flight.discard(original_name)
+
+    def _mark_done(self, original_name: str) -> None:
+        self.state.reset(original_name)
+        with self._transient_lock:
+            self._transient_retries.pop(original_name, None)
 
     def _handle_transient_failure(
         self, path: Path, requeue: "queue.Queue[Path] | None", exc: Exception
@@ -221,7 +323,9 @@ class Pipeline:
             tags=[depotlog.TAG_ERROR],
         )
         if retries >= MAX_TRANSIENT_RETRIES or requeue is None:
-            log.error("Giving up on transient retries for %s", original_name)
+            log.error("Giving up on transient retries for %s until the next sweep", original_name)
+            with self._transient_lock:
+                self._transient_retries.pop(original_name, None)
             return
         timer = threading.Timer(_TRANSIENT_RETRY_DELAY_SECONDS, requeue.put, args=(path,))
         timer.daemon = True
@@ -252,16 +356,10 @@ class Pipeline:
             )
 
     def _quarantine(self, path: Path) -> str:
-        self.webdav.mkcol(self.config.error_folder)
-        existing = {
-            e.path.rsplit("/", 1)[-1]
-            for e in self.webdav.list_dir(self.config.error_folder)
-            if not e.is_collection
-        }
-        final_name = naming.resolve_collision(path.name, existing)
-        dest_rel = f"{self.config.error_folder}/{final_name}"
-        self.webdav.put(dest_rel, path.read_bytes())
+        data = path.read_bytes()
+        dest_rel = self._put_with_collision_resolution(self.config.error_folder, path.name, data)
         self._delete_source(path.name)
+        self.ocr_cache.discard(hashlib.sha256(data).hexdigest())
         return dest_rel
 
     def _delete_source(self, original_name: str) -> None:
@@ -272,27 +370,59 @@ class Pipeline:
         src_rel = f"{self.config.scan_eingang_webdav_path}/{original_name}"
         self.webdav.delete(src_rel)
 
-    def _put_with_collision_resolution(self, folder: str, desired_name: str, data: bytes) -> str:
+    # ---- uploads -----------------------------------------------------------
+
+    def _names_in_folder(self, folder: str) -> set[str]:
+        """The file names already in `folder`, creating the folder if it
+        does not exist. Read from the local mount when the folder is there
+        (no request at all); otherwise one WebDAV listing."""
+        if self._mount_root is not None:
+            local_dir = self._mount_root / folder
+            if local_dir.is_dir():
+                names = {entry.name for entry in local_dir.iterdir() if entry.is_file()}
+                with self._folder_cache_lock:
+                    self._known_folders.add(folder)
+                return names
         with self._folder_cache_lock:
             assumed_existing = folder in self._known_folders
         if not assumed_existing:
             self.webdav.mkcol(folder)
-        existing_names = {
+        return {
             e.path.rsplit("/", 1)[-1]
             for e in self.webdav.list_dir(folder)
             if not e.is_collection
         }
-        final_name = naming.resolve_collision(desired_name, existing_names)
-        dest_rel = f"{folder}/{final_name}"
-        try:
-            self.webdav.put(dest_rel, data)
-        except RuntimeError:
-            if not assumed_existing:
-                raise
-            # The folder was listed a moment ago but is gone now (removed or
-            # renamed by hand in the meantime): create it and try once more.
-            self.webdav.mkcol(folder)
-            self.webdav.put(dest_rel, data)
+
+    def _put_with_collision_resolution(self, folder: str, desired_name: str, data: bytes) -> str:
+        """Upload under `desired_name`, or ' (2)', ' (3)', ... if that name
+        is taken. The upload itself refuses to overwrite, so a name taken
+        between the listing and the upload is caught too."""
+        existing_names = self._names_in_folder(folder)
+        with self._folder_cache_lock:
+            assumed_existing = folder in self._known_folders
+        for attempt in range(2):
+            final_name = naming.resolve_collision(desired_name, existing_names)
+            dest_rel = f"{folder}/{final_name}"
+            try:
+                self.webdav.put(dest_rel, data, overwrite=False)
+            except PreconditionFailed:
+                if attempt:
+                    raise
+                # Written by someone else in the meantime; list again, via
+                # WebDAV this time, and pick the next free name.
+                existing_names = {
+                    e.path.rsplit("/", 1)[-1] for e in self.webdav.list_dir(folder) if not e.is_collection
+                }
+                existing_names.add(final_name)
+                continue
+            except RuntimeError:
+                if not assumed_existing:
+                    raise
+                # The folder was listed a moment ago but is gone now (removed or
+                # renamed by hand in the meantime): create it and try once more.
+                self.webdav.mkcol(folder)
+                self.webdav.put(dest_rel, data, overwrite=False)
+            break
         with self._folder_cache_lock:
             self._known_folders.add(folder)
         return dest_rel
@@ -316,10 +446,13 @@ class Pipeline:
         self.depot_log.append(path.name, f"Duplikat von {prior_dest}", tags=tags, path=dest_rel)
         log.info("Duplicate %s (same content as %s) -> %s", path.name, prior_dest, dest_rel)
 
-    def _process(self, path: Path) -> None:
+    # ---- stage 1: everything before the model --------------------------------
+
+    def _prepare(self, path: Path) -> PreparedDocument | None:
+        """Duplicate check, title signals and OCR. None if the scan turned
+        out to be a duplicate (already filed as such)."""
         cfg = self.config
         original_name = path.name
-        today = date.today()
 
         # Read fresh per document (cheap local file read) rather than at
         # startup, so the user can toggle these directly in DEPOT
@@ -335,22 +468,62 @@ class Pipeline:
             content_hash = hashlib.file_digest(fh, "sha256").hexdigest()
         prior_dest = self.state.find_processed(content_hash)
         if prior_dest is not None and self.webdav.exists(prior_dest):
+            if self.state.source_pending_delete(content_hash):
+                # Our own earlier attempt: uploaded, then lost the connection
+                # before it could remove the scan. Only that step is left.
+                self._delete_source(original_name)
+                self.state.mark_source_deleted(content_hash)
+                self.ocr_cache.discard(content_hash)
+                self.depot_log.append(
+                    original_name, "Ablage war bereits erfolgt; Scan jetzt aus dem Eingang entfernt",
+                    tags=[], path=prior_dest,
+                )
+                log.info("%s had already been filed to %s; removed the source scan.", original_name, prior_dest)
+                return None
             self._file_duplicate(path, prior_dest, file_into_dokumente)
-            return
+            return None
 
         # What the document already says about itself without any OCR/LLM.
         name_signals = signals.analyze_filename(original_name)
         pdf_title, pdf_created = signals.read_pdf_metadata(path)
 
-        # Let a cold model load while OCR runs instead of after it.
-        threading.Thread(
-            target=classifier.preload_model, args=(cfg.ollama_host, cfg.ollama_model),
-            daemon=True, name="depot-preload",
-        ).start()
-
         started = time.perf_counter()
-        ocr_result = ocr.process_file(path, cfg.ocr_language)
+        ocr_result = self.ocr_cache.get(content_hash, path)
+        if ocr_result is not None:
+            log.info("Reusing the OCR result of an earlier attempt for %s", original_name)
+        else:
+            # Let a cold model load while OCR runs instead of after it.
+            threading.Thread(
+                target=classifier.preload_model, args=(cfg.ollama_host, cfg.ollama_model),
+                daemon=True, name="depot-preload",
+            ).start()
+            ocr_result = self.ocr_cache.put(content_hash, ocr.process_file(path, cfg.ocr_language), path)
         ocr_seconds = time.perf_counter() - started
+
+        return PreparedDocument(
+            path=path,
+            content_hash=content_hash,
+            ocr_result=ocr_result,
+            ocr_seconds=ocr_seconds,
+            name_signals=name_signals,
+            pdf_title=pdf_title,
+            pdf_created=pdf_created,
+            file_into_dokumente=file_into_dokumente,
+            save_processed_copy=save_processed_copy,
+            use_anthropic_classifier=use_anthropic_classifier,
+        )
+
+    # ---- stage 2: classification, filename, upload ---------------------------
+
+    def _finish(self, prepared: PreparedDocument) -> None:
+        cfg = self.config
+        path = prepared.path
+        original_name = path.name
+        today = date.today()
+        ocr_result = prepared.ocr_result
+        name_signals = prepared.name_signals
+        file_into_dokumente = prepared.file_into_dokumente
+
         produced_path = Path(ocr_result.ocr_pdf_path)
         using_raw_original = produced_path == path
         ext = path.suffix.lstrip(".") if using_raw_original else "pdf"
@@ -367,7 +540,7 @@ class Pipeline:
                 name_signals,
                 # Only a born-digital PDF's creation date says when the
                 # document was issued; for a scan it is just the scan time.
-                pdf_created if ocr_result.born_digital else None,
+                prepared.pdf_created if ocr_result.born_digital else None,
                 today,
             )
 
@@ -401,13 +574,13 @@ class Pipeline:
                 model=cfg.ollama_model,
                 dokumente_root=cfg.dokumente_webdav_root,
                 content=content,
-                pdf_title=pdf_title,
+                pdf_title=prepared.pdf_title,
                 filename_title=name_signals.title,
                 folder_files=self._get_folder_files(),
                 # The folder decision needs the date too (year subfolders).
                 resolve_date=lambda candidate: resolve_date(candidate)[0],
             )
-            if use_anthropic_classifier:
+            if prepared.use_anthropic_classifier:
                 result, classifier_tags = classifier.classify_via_anthropic(
                     **classify_args,
                     anthropic_api_key=cfg.anthropic_api_key,
@@ -438,7 +611,8 @@ class Pipeline:
             # calls it would otherwise cost).
             if content is None:
                 content = classifier.extract_content(
-                    ocr_result.text, original_name, cfg.ollama_host, cfg.ollama_model, pdf_title=pdf_title
+                    ocr_result.text, original_name, cfg.ollama_host, cfg.ollama_model,
+                    pdf_title=prepared.pdf_title,
                 )
             confidence = content.confidence
             title = content.title
@@ -465,7 +639,7 @@ class Pipeline:
             dest_rel = self._put_with_collision_resolution(target_folder, desired_name, produced_bytes)
 
         processed_rel: str | None = None
-        if save_processed_copy:
+        if prepared.save_processed_copy:
             processed_rel = self._put_with_collision_resolution(
                 self._processed_folder(), desired_name, produced_bytes
             )
@@ -483,16 +657,19 @@ class Pipeline:
                 "refusing to delete the source scan."
             )
 
+        # Recorded before the delete: should the connection drop in between,
+        # the next attempt removes the scan instead of filing it again.
+        self.state.record_processed(prepared.content_hash, dest_rel or processed_rel, source_deleted=False)
         self._delete_source(original_name)
-        self.state.record_processed(content_hash, dest_rel or processed_rel)
+        self.state.mark_source_deleted(prepared.content_hash)
         dav_seconds = time.perf_counter() - started
 
-        if not using_raw_original:
-            produced_path.unlink(missing_ok=True)
+        # Filed - the cached OCR result (and its PDF) is no longer needed.
+        self.ocr_cache.discard(prepared.content_hash)
 
         message = (
             f"confidence={confidence:.2f} | "
-            f"ocr={ocr_seconds:.1f}s llm={llm_seconds:.1f}s dav={dav_seconds:.1f}s"
+            f"ocr={prepared.ocr_seconds:.1f}s llm={llm_seconds:.1f}s dav={dav_seconds:.1f}s"
         )
         if suggestion:
             message += f" | Vorschlag: {suggestion}"

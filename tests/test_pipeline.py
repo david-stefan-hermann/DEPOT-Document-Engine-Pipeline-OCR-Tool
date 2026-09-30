@@ -837,11 +837,11 @@ def test_upload_recovers_when_a_listed_folder_has_disappeared(monkeypatch, tmp_p
     real_put = client.put
     attempts = []
 
-    def put_failing_without_parent(rel_path, data):
+    def put_failing_without_parent(rel_path, data, overwrite=True):
         attempts.append(rel_path)
         if rel_path.startswith("Dokumente/Gesundheit/") and "Dokumente/Gesundheit" not in fake_server.collections:
             raise RuntimeError("PUT failed: HTTP 409")
-        return real_put(rel_path, data)
+        return real_put(rel_path, data, overwrite=overwrite)
 
     pipeline.webdav.put = put_failing_without_parent
 
@@ -919,4 +919,280 @@ def test_unsorted_document_keeps_the_suggested_folder_in_its_log_line(
     log_text = _get_log_text(fake_server, client)
     assert "Vorschlag: Dokumente/IT Sachen" in log_text
     assert log_text.rstrip().endswith(".pdf")  # the real destination stays last on the line
+
+
+# ---- two stages: OCR (CPU) and LLM (GPU) run at the same time --------------
+
+def _wait_until(predicate, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return predicate()
+
+
+def _text_ocr(text="text"):
+    return lambda path, language: OcrResult(text=text, page_count=1, ocr_pdf_path=str(path), ocr_failed=False)
+
+
+def test_workers_file_a_document_end_to_end_through_both_stages(monkeypatch, tmp_path, pipeline, fake_server, client):
+    from depot.workqueue import WorkQueue
+
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _text_ocr())
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Gesundheit"))
+    q = WorkQueue()
+
+    threads = pipeline.run_workers(q)
+    q.put(scan)
+
+    assert _wait_until(lambda: any(p.startswith("Dokumente/Gesundheit/") for p in fake_server.files))
+    assert _wait_until(lambda: client.get(f"Scan-Eingang/{scan.name}") is None)
+    names = {t.name for t in threads}
+    assert names == {"depot-ocr-0", "depot-llm"}
+    assert _wait_until(lambda: not pipeline._in_flight)
+
+
+def test_ocr_of_the_next_document_runs_while_the_first_is_classified(monkeypatch, tmp_path, pipeline, fake_server, client):
+    import threading
+
+    from depot.workqueue import WorkQueue
+
+    scan1 = _make_scan(tmp_path, "scan1.pdf", b"%PDF-one")
+    scan2 = _make_scan(tmp_path, "scan2.pdf", b"%PDF-two")
+    for s in (scan1, scan2):
+        _seed_source_on_server(pipeline, client, s)
+
+    second_ocr_started = threading.Event()
+    classify_entered = threading.Event()
+    overlap_seen = []
+
+    def fake_ocr(path, language):
+        if path.name == "scan2.pdf":
+            second_ocr_started.set()
+        return OcrResult(text="text", page_count=1, ocr_pdf_path=str(path), ocr_failed=False)
+
+    def fake_classify(**kwargs):
+        classify_entered.set()
+        # Block the LLM stage; the OCR stage must get to scan2 meanwhile.
+        overlap_seen.append(second_ocr_started.wait(timeout=3.0))
+        return _classify_into("Dokumente/Gesundheit")(**kwargs)
+
+    monkeypatch.setattr(ocr, "process_file", fake_ocr)
+    monkeypatch.setattr(classifier, "classify", fake_classify)
+    q = WorkQueue()
+    pipeline.run_workers(q)
+
+    q.put(scan1)
+    assert classify_entered.wait(timeout=3.0)
+    q.put(scan2)
+
+    assert _wait_until(lambda: len([p for p in fake_server.files if p.startswith("Dokumente/Gesundheit/")]) == 2)
+    assert overlap_seen[0] is True
+
+
+def test_transient_failure_in_the_llm_stage_does_not_repeat_the_ocr(monkeypatch, tmp_path, pipeline, fake_server, client):
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    ocr_calls = []
+
+    def fake_ocr(path, language):
+        ocr_calls.append(path.name)
+        return OcrResult(text="Krankenkasse", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False)
+
+    monkeypatch.setattr(ocr, "process_file", fake_ocr)
+
+    def ollama_down(**kwargs):
+        raise httpx.ConnectError("Ollama unreachable")
+
+    monkeypatch.setattr(classifier, "classify", ollama_down)
+    pipeline.process_one(scan)  # first attempt: OCR done, classification fails
+
+    assert ocr_calls == ["scan1.pdf"]
+    assert not any(p.startswith("Dokumente/") for p in fake_server.files)
+    assert pipeline.state.should_quarantine(scan.name) is False  # transient, not counted
+
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Gesundheit"))
+    pipeline.process_one(scan)  # retry (what the timer / the sweep does)
+
+    assert ocr_calls == ["scan1.pdf"]  # no second OCR
+    filed = [p for p in fake_server.files if p.startswith("Dokumente/Gesundheit/")]
+    assert len(filed) == 1
+    assert fake_server.files[filed[0]] == b"%PDF-with-text-layer"  # the cached OCR output was uploaded
+    assert not list((tmp_path / "ocr-cache").iterdir())  # and dropped from the cache once filed
+
+
+def test_ocr_result_survives_a_restart(monkeypatch, tmp_path, fake_server, client):
+    scan = _make_scan(tmp_path)
+    p1 = _make_pipeline(tmp_path, client)
+    _seed_source_on_server(p1, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="Krankenkasse", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+
+    def ollama_down(**kwargs):
+        raise httpx.ConnectError("Ollama unreachable")
+
+    monkeypatch.setattr(classifier, "classify", ollama_down)
+    p1.process_one(scan)
+    p1.state.close()
+
+    # "container restart": a new pipeline over the same scratch directory
+    p2 = _make_pipeline(tmp_path, client)
+
+    def _must_not_run(path, language):
+        raise AssertionError("OCR must not run again after a restart")
+
+    monkeypatch.setattr(ocr, "process_file", _must_not_run)
+    seen_text = []
+
+    def fake_classify(**kwargs):
+        seen_text.append(kwargs["ocr_text"])
+        return _classify_into("Dokumente/Gesundheit")(**kwargs)
+
+    monkeypatch.setattr(classifier, "classify", fake_classify)
+    p2.process_one(scan)
+
+    assert seen_text == ["Krankenkasse"]
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Gesundheit/")]) == 1
+    p2.state.close()
+
+
+def test_connection_lost_between_upload_and_delete_does_not_file_a_second_copy(
+    monkeypatch, tmp_path, pipeline, fake_server, client
+):
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _text_ocr())
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Gesundheit"))
+    real_delete = client.delete
+
+    def delete_fails_once(rel_path):
+        client.delete = real_delete
+        raise httpx.ReadTimeout("gone away")
+
+    client.delete = delete_fails_once
+    pipeline.process_one(scan)
+
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Gesundheit/")]) == 1
+    assert client.get(f"Scan-Eingang/{scan.name}") is not None  # still in the inbox
+
+    classify_calls = []
+    monkeypatch.setattr(classifier, "classify", lambda **kwargs: classify_calls.append(1))
+    pipeline.process_one(scan)  # the retry
+
+    assert classify_calls == []  # nothing to classify again
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Gesundheit/")]) == 1  # no " (2)"
+    assert not any(p.startswith("Dokumente/Unsortiert/") for p in fake_server.files)  # and no "(Duplikat)"
+    assert client.get(f"Scan-Eingang/{scan.name}") is None
+    logs = [client.get(p).decode("utf-8") for p in fake_server.files if "DEPOT Dateilog" in p]
+    assert any("bereits erfolgt" in t for t in logs)
+
+
+def test_file_removed_while_waiting_for_the_llm_stage_is_skipped(monkeypatch, tmp_path, pipeline, fake_server, client):
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _text_ocr())
+    handed = []
+    pipeline.process_one(scan, hand_off=handed.append)
+    assert len(handed) == 1 and scan.name in pipeline._in_flight
+
+    scan.unlink()  # taken out of the inbox by hand
+    monkeypatch.setattr(classifier, "classify", lambda **kwargs: (_ for _ in ()).throw(AssertionError("no")))
+    pipeline._finish_guarded(handed[0], requeue=None)
+
+    assert scan.name not in pipeline._in_flight
+    assert pipeline.state.should_quarantine(scan.name) is False
+    assert not any("DEPOT Dateilog" in p for p in fake_server.files)  # not an error either
+    assert not list((tmp_path / "ocr-cache").iterdir())
+
+
+def test_quarantine_drops_the_cached_ocr_result(monkeypatch, tmp_path, pipeline, fake_server, client):
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+
+    def broken(**kwargs):
+        raise ValueError("model answered garbage")
+
+    monkeypatch.setattr(classifier, "classify", broken)
+    for _ in range(3):
+        pipeline.process_one(scan)
+
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/_Fehlerhaft/")]) == 1
+    assert not list((tmp_path / "ocr-cache").iterdir())
+
+
+# ---- leaner upload: no listing when the mount has the folder, never overwrite ---
+
+def test_upload_refuses_to_overwrite_a_file_written_in_between(pipeline, client, fake_server):
+    client.mkcol("Dokumente/Gesundheit")
+    real_list_dir = client.list_dir
+    listings = []
+
+    def list_then_race(rel_path):
+        entries = real_list_dir(rel_path)
+        listings.append(rel_path)
+        if len(listings) == 1:
+            # someone else writes the very name we are about to use
+            fake_server.files["Dokumente/Gesundheit/a.pdf"] = b"theirs"
+        return entries
+
+    client.list_dir = list_then_race
+
+    dest = pipeline._put_with_collision_resolution("Dokumente/Gesundheit", "a.pdf", b"mine")
+
+    assert dest == "Dokumente/Gesundheit/a (2).pdf"
+    assert fake_server.files["Dokumente/Gesundheit/a.pdf"] == b"theirs"
+    assert fake_server.files[dest] == b"mine"
+
+
+def test_collision_check_reads_the_local_mount_instead_of_listing_via_webdav(tmp_path, client, fake_server):
+    mount = tmp_path / "mount"
+    inbox = mount / "Dokumente" / "Scan Eingang"
+    inbox.mkdir(parents=True)
+    target = mount / "Dokumente" / "Gesundheit"
+    target.mkdir()
+    (target / "2026-01-01 Bescheid.pdf").write_bytes(b"x")
+    p = _make_pipeline(
+        tmp_path, client,
+        scan_eingang_local_path=str(inbox), scan_eingang_webdav_path="Dokumente/Scan Eingang",
+    )
+
+    def _no_listing(*a, **k):
+        raise AssertionError("the folder is on the mount; no WebDAV listing needed")
+
+    p.webdav.list_dir = _no_listing
+    p.webdav.mkcol = _no_listing
+
+    dest = p._put_with_collision_resolution("Dokumente/Gesundheit", "2026-01-01 Bescheid.pdf", b"y")
+
+    assert dest == "Dokumente/Gesundheit/2026-01-01 Bescheid (2).pdf"
+    assert fake_server.files[dest] == b"y"
+    p.state.close()
+
+
+def test_folder_missing_on_the_mount_is_created_via_webdav(tmp_path, client, fake_server):
+    mount = tmp_path / "mount"
+    inbox = mount / "Dokumente" / "Scan Eingang"
+    inbox.mkdir(parents=True)
+    p = _make_pipeline(
+        tmp_path, client,
+        scan_eingang_local_path=str(inbox), scan_eingang_webdav_path="Dokumente/Scan Eingang",
+    )
+
+    dest = p._put_with_collision_resolution("Dokumente/Neu", "a.pdf", b"x")
+
+    assert dest == "Dokumente/Neu/a.pdf"
+    assert "Dokumente/Neu" in fake_server.collections
+    p.state.close()
 

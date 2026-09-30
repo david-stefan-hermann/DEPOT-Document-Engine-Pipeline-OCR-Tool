@@ -51,3 +51,38 @@ def test_processed_hash_is_remembered_across_reconnect(tmp_path):
     store2.record_processed("abc", "Dokumente/B/x.pdf")
     assert store2.find_processed("abc") == "Dokumente/B/x.pdf"
     store2.close()
+
+
+def test_source_pending_delete_until_marked(tmp_path):
+    store = StateStore(str(tmp_path / "state.sqlite3"))
+    assert store.source_pending_delete("abc") is False  # unknown hash
+    store.record_processed("abc", "Dokumente/A/x.pdf", source_deleted=False)
+    assert store.source_pending_delete("abc") is True
+    store.mark_source_deleted("abc")
+    assert store.source_pending_delete("abc") is False
+    # the default records a completed filing
+    store.record_processed("def", "Dokumente/A/y.pdf")
+    assert store.source_pending_delete("def") is False
+    store.close()
+
+
+def test_opens_a_database_from_before_the_source_deleted_column(tmp_path):
+    import sqlite3
+
+    db_path = str(tmp_path / "state.sqlite3")
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "CREATE TABLE failures (filename TEXT PRIMARY KEY, count INTEGER NOT NULL DEFAULT 0);"
+        "CREATE TABLE processed (sha256 TEXT PRIMARY KEY, dest_path TEXT NOT NULL);"
+        "INSERT INTO processed VALUES ('abc', 'Dokumente/A/x.pdf');"
+    )
+    conn.commit()
+    conn.close()
+
+    store = StateStore(db_path)
+    assert store.find_processed("abc") == "Dokumente/A/x.pdf"
+    assert store.source_pending_delete("abc") is False  # old rows count as completed
+    store.record_processed("def", "Dokumente/B/y.pdf", source_deleted=False)
+    assert store.source_pending_delete("def") is True
+    store.close()
+    StateStore(db_path).close()  # applying the migration twice is harmless

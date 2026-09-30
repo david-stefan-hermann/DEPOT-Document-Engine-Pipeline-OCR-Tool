@@ -8,6 +8,7 @@ on:
       - requirements.txt
       - run.py
       - depot/**
+      - tools/**
   workflow_dispatch:
 
 env:

@@ -1,7 +1,8 @@
 # DEPOT — Überarbeitungsplan: bessere Zuordnung, schnellere Verarbeitung
 
-Stand: 2026-09-30. Status: **Phase 0, 1 und 2 umgesetzt (plus Duplikat-Erkennung), Phase 3–4
-offen** — Ergebnisse und Messwerte in den Abschnitten 5a (Phase 1) und 5b (Phase 2). Ergänzt [plan.md](plan.md)
+Stand: 2026-10-01. Status: **Phase 0–3 umgesetzt, Phase 4 offen** — Ergebnisse und
+Messwerte in den Abschnitten 5a (Phase 1), 5b (Phase 2) und 5c (Phase 3; die OCR-Messung
+3.3 steht noch aus, das Werkzeug dafür liegt bereit). Ergänzt [plan.md](plan.md)
 (Architektur-Ist-Stand) um eine priorisierte Überarbeitung. Grundlage sind nicht Vermutungen,
 sondern (a) der komplette Code, (b) die 31 echten Dateilog-Einträge aus dem Produktivbetrieb,
 (c) die tatsächlich abgelegten PDFs und (d) Live-Messungen gegen den echten Ollama-Server
@@ -351,6 +352,60 @@ Einordnung:
   weniger belegt und es geht mehr nach `Unsortiert`.
 - Der eigene Name des Nutzers in Titel und Dateinamen erzeugt gelegentlich Zufallstreffer.
 
+### 5c. Stand nach Phase 3 (2026-10-01)
+
+Umsetzung der Planpunkte und Abweichungen (Details zum Ablauf in [plan.md](plan.md)):
+
+- **3.1 Zwei Stufen** — umgesetzt. `MAX_CONCURRENT_JOBS` zählt jetzt nur die OCR-Threads;
+  die LLM-Stufe ist immer genau ein Thread. Die Übergabe zwischen den Stufen ist ein
+  `PreparedDocument` (Hash, Signale aus Dateiname/PDF, OCR-Ergebnis, die Schalter aus
+  `DEPOT Config.json` zum Zeitpunkt des OCR). Wird eine Datei aus dem Eingang genommen,
+  während sie auf die LLM-Stufe wartet, wird sie still übersprungen statt als Fehler
+  gezählt.
+- **3.2 OCR-Ergebnis zwischenspeichern** — umgesetzt (`ocr_cache.py`), mit einer
+  Abweichung: Schlüssel ist der SHA-256 des Scans, nicht Pfad+Größe+mtime — er wird für
+  den Duplikat-Check ohnehin berechnet und überlebt ein Umbenennen der Datei im Eingang.
+  Der Eintrag (Text + ggf. erzeugtes PDF) liegt unter `/scratch/ocr-cache`, wird nach der
+  Ablage gelöscht, sonst nach 7 Tagen. Ein Wiederholungsversuch nach transientem Fehler
+  in der LLM-Stufe und ein Container-Neustart mitten im Batch kosten damit kein zweites
+  OCR mehr.
+- **3.3 OCR-Optionen nach Messung** — Werkzeug fertig (`tools/ocr_bench.py`: Varianten
+  ohne `--clean`, ohne `--deskew`, ohne `--rotate-pages`, `--optimize 0`, `deu+eng`,
+  `--jobs 1/4`; je Zeit, Größe, Wortzahl und Textübereinstimmung mit dem heutigen Stand),
+  **Messung offen**: Tesseract gibt es nur im Container, und Docker Desktop auf dem
+  Entwicklungsrechner startet derzeit nicht. Die Optionen sind deshalb unverändert. Lauf
+  auf dem Server: `docker compose exec depot python tools/ocr_bench.py
+  /nextcloud-data/Dokumente/<Beispielscans...> --out /scratch/ocr-bench.json`.
+  Entscheidungsregel danach: eine Option bleibt nur, wenn sie Text bringt, den die
+  Variante ohne sie nicht liefert — nicht, weil sie "sauberer" klingt.
+- **3.4 Periodischer Sweep** — umgesetzt (`SWEEP_INTERVAL_SECONDS`, Default 600, 0 = aus).
+  Nimmt nur Dateien, die seit 60 s unverändert sind und nicht gerade vom Watcher
+  entprellt werden. Dazu eine Queue ohne Doppeleinträge (`workqueue.py`): Event, Sweep
+  und Retry-Timer melden dieselbe Datei sonst mehrfach, und jede Meldung wäre ein
+  eigener Verarbeitungs- bzw. Fehlversuch. Nach 5 transienten Wiederholungen bleibt die
+  Datei liegen; der nächste Sweep ist der nächste Versuch (vorher: bis zum Neustart
+  nichts mehr).
+- **3.5 Duplikate** — war bereits umgesetzt (E4).
+- **3.6 Ablage schlanker** — umgesetzt: die Kollisionsprüfung liest die vorhandenen
+  Dateinamen vom lokalen Mount, wenn der Zielordner dort liegt (kein Request mehr statt
+  MKCOL-Prüfung + PROPFIND); der PUT läuft immer mit `If-None-Match: *` und überschreibt
+  daher nie — wird der Name zwischen Prüfung und Upload vergeben, antwortet Nextcloud
+  mit 412 und DEPOT nimmt den nächsten freien Namen.
+- **Zusätzlich (Robustheit, aus der Fehleranalyse für 3.1):** bricht die Verbindung
+  zwischen Upload und Löschen des Scans weg, legte der Wiederholungsversuch bisher eine
+  zweite Kopie "(2)" ab. Jetzt wird der Ablageort VOR dem Löschen in der sqlite-DB
+  vermerkt (`processed.source_deleted`); der nächste Versuch erkennt die erfolgte Ablage
+  und entfernt nur noch den Scan (Logzeile "Ablage war bereits erfolgt"). Bestehende
+  Datenbanken werden beim Start um die Spalte ergänzt.
+
+**Messung:** Der Durchsatzgewinn von 3.1 ist mit dem Offline-Testsatz nicht messbar (kein
+Tesseract); ein Test belegt nur den Mechanismus (OCR von Dokument 2 läuft, während die
+Klassifikation von Dokument 1 blockiert). Erwartung aus dem Mechanismus: bei einem Batch von
+Scanner-PDFs sinkt die Zeit pro Dokument von OCR + LLM auf die längere der beiden Stufen;
+bei digitalen PDFs (OCR ≈ 1 s) ändert sich nichts. Die echten Zahlen liefern die
+`ocr=`/`llm=`-Werte in den Dateilogs nach dem Deploy (die Zeitstempel-Abstände zwischen
+den Logs geben den Durchsatz, die Stufenwerte die Auslastung).
+
 ### Phase 3 — Durchsatz und Robustheit
 
 - **3.1 Zwei Stufen**: OCR-Worker (CPU) → LLM-Worker (GPU, genau 1, damit der Prompt-Cache
@@ -365,6 +420,7 @@ Einordnung:
   (siehe E4).
 - **3.6 Ablage schlanker**: Kollisionsprüfung über den Mount bzw. `If-None-Match: *` statt
   Verzeichnis-Listing.
+- **Abnahme:** siehe 5c. Ergebnis der OCR-Messung (3.3) wird dort nachgetragen.
 
 ### Phase 4 — Optional, nur wenn die Eval-Zahlen es rechtfertigen
 
@@ -383,6 +439,8 @@ Einordnung:
 | Digitales PDF, 1 Seite | LLM sieht keinen Text | voller Originaltext |
 | Foto mit sprechendem Namen | doppeltes OCR, `Unsortiert` | einfaches OCR, Zuordnung über den Namen |
 | Erstes Dokument eines Batches | +11 s Modell-Ladezeit | lädt parallel zum OCR |
+| Batch von Scanner-PDFs (Phase 3) | OCR + LLM nacheinander | OCR von n+1 während LLM von n |
+| Retry/Neustart nach transientem Fehler (Phase 3) | OCR erneut | OCR aus dem Cache |
 | LLM-Zeit lokaler Pfad | ≈ 29 s | ≈ 10–12 s |
 | Absender ohne eigenen Ordner | lokal falsch (bekannte Grenze) | über Absender-Historie/Ordnerinhalt |
 

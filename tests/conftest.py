@@ -68,6 +68,8 @@ class FakeNextcloud:
             return httpx.Response(201)
 
         if method == "PUT":
+            if request.headers.get("If-None-Match") == "*" and rel in self.files:
+                return httpx.Response(412)
             self.files[rel] = request.content
             return httpx.Response(201)
 

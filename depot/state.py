@@ -12,9 +12,16 @@ CREATE TABLE IF NOT EXISTS failures (
 );
 CREATE TABLE IF NOT EXISTS processed (
     sha256 TEXT PRIMARY KEY,
-    dest_path TEXT NOT NULL
+    dest_path TEXT NOT NULL,
+    source_deleted INTEGER NOT NULL DEFAULT 1
 );
 """
+
+# Added after the table first shipped; CREATE TABLE IF NOT EXISTS leaves an
+# existing table alone, so the column is added separately.
+_MIGRATIONS = [
+    "ALTER TABLE processed ADD COLUMN source_deleted INTEGER NOT NULL DEFAULT 1",
+]
 
 
 class StateStore:
@@ -31,6 +38,11 @@ class StateStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
+        for statement in _MIGRATIONS:
+            try:
+                self._conn.execute(statement)
+            except sqlite3.OperationalError:
+                pass  # already applied
         self._conn.commit()
 
     def close(self) -> None:
@@ -65,10 +77,28 @@ class StateStore:
         ).fetchone()
         return row[0] if row else None
 
-    def record_processed(self, sha256: str, dest_path: str) -> None:
+    def record_processed(self, sha256: str, dest_path: str, source_deleted: bool = True) -> None:
+        """Remember where a scan was filed. Recorded with source_deleted=False
+        right after the upload and before the scan is removed from the
+        inbox, so that a connection lost in between is recognized on the
+        next attempt (see source_pending_delete) instead of filing a second
+        copy."""
         with self._conn:
             self._conn.execute(
-                "INSERT INTO processed (sha256, dest_path) VALUES (?, ?) "
-                "ON CONFLICT(sha256) DO UPDATE SET dest_path = excluded.dest_path",
-                (sha256, dest_path),
+                "INSERT INTO processed (sha256, dest_path, source_deleted) VALUES (?, ?, ?) "
+                "ON CONFLICT(sha256) DO UPDATE SET "
+                "dest_path = excluded.dest_path, source_deleted = excluded.source_deleted",
+                (sha256, dest_path, int(source_deleted)),
             )
+
+    def mark_source_deleted(self, sha256: str) -> None:
+        with self._conn:
+            self._conn.execute("UPDATE processed SET source_deleted = 1 WHERE sha256 = ?", (sha256,))
+
+    def source_pending_delete(self, sha256: str) -> bool:
+        """True if this content was filed but its scan is still known to be
+        in the inbox."""
+        row = self._conn.execute(
+            "SELECT source_deleted FROM processed WHERE sha256 = ?", (sha256,)
+        ).fetchone()
+        return bool(row) and not row[0]

@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import logging
-import queue
 import signal
 import sys
 
 from depot.config import Config
 from depot.pipeline import Pipeline
 from depot.watcher import ScanWatcher
+from depot.workqueue import WorkQueue
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,7 +25,7 @@ def main() -> None:
         pipeline.webdav.check_connection()
         log.info("WebDAV connection OK.")
 
-        work_queue: "queue.Queue" = queue.Queue()
+        work_queue = WorkQueue()
         watcher = ScanWatcher(
             local_path=config.scan_eingang_local_path,
             supported_extensions=config.supported_extensions,
@@ -39,6 +39,7 @@ def main() -> None:
 
         workers = pipeline.run_workers(work_queue)
         watcher.start()
+        watcher.start_periodic_sweep(config.sweep_interval_seconds)
     except Exception:
         log.error("Startup failed, exiting.", exc_info=True)
         pipeline.close()

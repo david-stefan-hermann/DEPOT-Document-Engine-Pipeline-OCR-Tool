@@ -17,12 +17,21 @@ log = logging.getLogger(__name__)
 STABLE_CHECK_INTERVAL = 0.5
 STABLE_CHECKS_REQUIRED = 4  # ~2s of unchanged size before considering a file "done"
 
+# A file the periodic sweep finds is only queued once it has not been
+# modified for this long - anything younger is either still being written
+# or already on its way through the watcher's own debounce.
+SWEEP_MIN_AGE_SECONDS = 60.0
+
 
 class ScanWatcher:
     """Watches the local (read-only) Scan-Eingang mount for new files and
     feeds fully-written, supported scans into a processing queue. Also
     performs a startup sweep so files that arrived while the container was
-    down get picked up too."""
+    down get picked up too, and a periodic sweep for anything that is still
+    lying there afterwards: a file whose filesystem event never arrived
+    (inotify does not see every write on every kind of mount), or one whose
+    processing was given up after repeated transient failures - the next
+    sweep is its next attempt."""
 
     def __init__(
         self,
@@ -84,6 +93,51 @@ class ScanWatcher:
             if self._should_consider(entry):
                 log.info("Startup sweep found: %s", entry.name)
                 self._out_queue.put(entry)
+
+    def sweep(self, min_age_seconds: float = SWEEP_MIN_AGE_SECONDS) -> list[Path]:
+        """Queue every supported file in the inbox that has been unchanged
+        for `min_age_seconds` and is not already being debounced. Returns
+        the files it queued. The queue itself ignores paths that are
+        already waiting in it, and the pipeline skips files it is
+        currently processing."""
+        if not self._local_path.is_dir():
+            return []
+        now = time.time()
+        with self._pending_lock:
+            pending = set(self._pending)
+        found: list[Path] = []
+        for entry in sorted(self._local_path.iterdir()):
+            if entry in pending or not self._should_consider(entry):
+                continue
+            try:
+                if now - entry.stat().st_mtime < min_age_seconds:
+                    continue
+            except FileNotFoundError:
+                continue
+            found.append(entry)
+            self._out_queue.put(entry)
+        if found:
+            log.info("Sweep found %d file(s) in the inbox: %s", len(found), ", ".join(p.name for p in found))
+        return found
+
+    def start_periodic_sweep(self, interval_seconds: float) -> threading.Thread | None:
+        """Run sweep() every `interval_seconds` in a background thread.
+        Disabled (returns None) for a non-positive interval."""
+        if interval_seconds <= 0:
+            return None
+
+        def _loop() -> None:
+            while True:
+                time.sleep(interval_seconds)
+                try:
+                    self.sweep()
+                except Exception:
+                    log.exception("Periodic sweep failed")
+
+        thread = threading.Thread(target=_loop, daemon=True, name="depot-sweep")
+        thread.start()
+        log.info("Sweeping %s every %.0f s for files left behind", self._local_path, interval_seconds)
+        return thread
 
     def start(self) -> None:
         if not self._local_path.is_dir():

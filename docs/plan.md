@@ -87,23 +87,40 @@ Scan Eingang (Nextcloud-Datenverzeichnis, i.d.R. Dokumente/Scan Eingang, read-on
               Bind-Mount für schnellen Lesezugriff)
    │
    ▼
-watcher.py (watchdog Observer, on_created/on_moved + Startup-Sweep bei Container-Start)
+watcher.py (watchdog Observer, on_created/on_moved + Startup-Sweep bei Container-Start
+            + periodischer Sweep, Default alle 10 min)
    │  - ignoriert Dateinamen, die "DEPOT Dateilog" enthalten
    │  - ignoriert nicht-whitelisted Dateiendungen (.pdf .jpg .jpeg .png .tif .tiff)
    │  - Debounce: wartet bis Dateigröße ~2s stabil ist (Scanner schreiben inkrementell)
    │  - nicht-rekursiv: `Scan Eingang/Depot Config/` (Logs, `DEPOT Config.json`,
    │    `Processed/`, `_Fehlerhaft/`) wird dadurch strukturell nie als Scan-Eingabe
    │    betrachtet, ganz ohne Namensfilter
+   │  - der periodische Sweep nimmt nur Dateien, die seit ≥ 60 s unverändert sind, und
+   │    holt so verpasste Events und aufgegebene Wiederholungsversuche nach
    ▼
-pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
+workqueue.py: eine Queue, die jeden Pfad höchstens einmal enthält (Event, Sweep und
+              Retry-Timer melden dieselbe Datei oft mehrfach)
+   ▼
+pipeline.py — zwei Stufen, damit CPU und GPU gleichzeitig arbeiten:
+   Stufe 1 "OCR" (MAX_CONCURRENT_JOBS Threads, Default 1) und
+   Stufe 2 "LLM" (genau EIN Thread: das Modell hält den Kontext eines Dokuments, ein
+   zweites würde Ollamas Prompt-Cache verdrängen). Während Dokument n klassifiziert
+   wird, läuft bereits das OCR von Dokument n+1.
    │
-   ├─► Duplikat-Check: SHA-256 des Scans gegen die sqlite-DB; liegt derselbe Inhalt
-   │           noch am damaligen Ablageort → kein OCR/LLM, Ablage in Unsortiert als
-   │           "<Name der Erstablage> (Duplikat).ext", Tag [DUPLIKAT]
+   ├─► Stufe 1: Duplikat-Check: SHA-256 des Scans gegen die sqlite-DB; liegt derselbe
+   │           Inhalt noch am damaligen Ablageort → kein OCR/LLM, Ablage in Unsortiert
+   │           als "<Name der Erstablage> (Duplikat).ext", Tag [DUPLIKAT]. Sonderfall:
+   │           war es DEPOTs eigener vorheriger Versuch, dem nach dem Upload die
+   │           Verbindung wegbrach, wird nur noch der Scan aus dem Eingang entfernt.
    │
    ├─► signals.py (ohne LLM): Dateiname → Nutzertitel + Datum oder Scanner-Name
    │           (nur Scan-Zeitpunkt); PDF-Metadaten → Titel, Erstelldatum; alle
    │           Datumsangaben im Text als Prüfmenge fürs Ausstellungsdatum
+   │
+   ├─► ocr_cache.py: OCR-Ergebnis (Text + erzeugtes PDF) liegt unter /scratch, bis der
+   │           Scan abgelegt ist — ein Retry nach transientem Fehler oder ein
+   │           Container-Neustart mitten im Batch wiederholt kein OCR. Schlüssel ist
+   │           der SHA-256 des Scans (ohnehin für den Duplikat-Check berechnet).
    │
    ├─► ocr.py: PDF mit vollständiger eigener Textebene (digital erzeugt) → KEIN OCR,
    │           Text per pymupdf, Original wird unverändert abgelegt. Sonst:
@@ -116,7 +133,7 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │           abgelegt; mit sprechendem Dateinamen trotzdem Klassifikation über den
    │           Namen ([NUR-DATEINAME]), sonst Fallback mit Konfidenz 0.
    │
-   ├─► Ordnerliste: per os.walk vom lokalen read-only-Mount, wenn er den Baum abdeckt
+   ├─► Stufe 2 (ab hier): Ordnerliste per os.walk vom lokalen read-only-Mount, wenn er den Baum abdeckt
    │           (15 s gecacht), sonst wie bisher per webdav.py: PROPFIND auf Dokumente/
    │           (Depth:1 rekursiv, da Nextcloud kein Depth:infinity erlaubt), 5 Min.
    │           gecacht (self-erstellte Ordner sofort im Cache ergänzt). Gefiltert um
@@ -208,7 +225,11 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │
    ├─► naming.py: Titel sanitizen, Datum validieren, Dateiname
    │           "YYYY-MM-DD [Absender - ]Titel.ext" bauen, Kollisionen auflösen
-   │           ("(2)", "(3)", …)
+   │           ("(2)", "(3)", …). Die vorhandenen Namen kommen vom lokalen Mount, wenn
+   │           der Zielordner dort liegt (kein Request), sonst per PROPFIND; der PUT
+   │           selbst läuft mit `If-None-Match: *` und überschreibt daher nie — wird
+   │           der Name in der Zwischenzeit vergeben, kommt 412 und der nächste freie
+   │           Name.
    │
    ├─► webdav.py: MKCOL (falls neuer Ordner) + PUT (neue durchsuchbare PDF hochladen,
    │           je nach Konfiguration nach Dokumente/... und/oder flach nach
@@ -320,9 +341,11 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
   run.py
   depot/
     config.py       # Env-Loading, dataclass
-    watcher.py       # watchdog + Startup-Sweep + Debounce + Queue
-    pipeline.py      # Verarbeitung pro Datei
+    watcher.py       # watchdog + Startup-/periodischer Sweep + Debounce
+    workqueue.py     # Queue ohne Doppeleinträge
+    pipeline.py      # zwei Stufen (OCR / LLM+Upload), Fehlerbehandlung, Uploads
     ocr.py           # Textebenen-Check, img2pdf/ocrmypdf-Wrapper, Qualitätscheck
+    ocr_cache.py     # OCR-Ergebnisse bis zur Ablage aufbewahren (/scratch)
     signals.py       # Dateiname/PDF-Metadaten/Datumsangaben auswerten (ohne LLM)
     folder_index.py  # Ordnerbaum samt Dateinamen vom lokalen Mount lesen
     webdav.py        # PROPFIND / MKCOL / PUT / GET / DELETE / MOVE, httpx-basiert
@@ -331,13 +354,14 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
     naming.py        # Sanitizing, Dateiname bauen, Kollisionen, Absender-Normalisierung
     depotlog.py      # Dateilog-TXT-Writer, ein File pro Verarbeitungs-Event
     scan_config.py   # DEPOT Config.json (excluded_folders) lesen/anwenden
-    state.py         # sqlite: Fehlversuche + Hashes bereits abgelegter Scans
+    state.py         # sqlite: Fehlversuche + Hashes/Ablageort bereits abgelegter Scans
     models.py        # pydantic-Schemas (ContentExtraction, FolderPick, FolderStepDecision)
   tests/
     conftest.py       # Fake-Nextcloud-WebDAV-Server für Tests
     test_*.py
-  tools/
-    eval.py           # Klassifikations-Eval gegen einen handsortierten Baum (nicht im Image)
+  tools/                # im Image enthalten, damit sie auch im Container laufen
+    eval.py           # Klassifikations-Eval gegen einen handsortierten Baum
+    ocr_bench.py      # ocrmypdf-Optionen auf Beispielscans messen (Zeit, Größe, Text)
   infra/
     ollama/
       docker-compose.yml  # Ollama-Stack für Dockge auf dem TrueNAS-Server
@@ -362,9 +386,11 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
   loggen und unangetastet lassen.
 - **Fast leerer OCR-Text:** erzwungene Konfidenz 0, Fallback nach `Unsortiert`,
   `[OCR-FEHLGESCHLAGEN]` im Log.
-- **Ollama nicht erreichbar/Timeout:** ~120s Timeout, ein Retry mit Backoff, danach
-  transienter Fallback (zählt nicht zum permanenten Fehlerlimit, wird stattdessen
-  automatisch requeued).
+- **Ollama/Nextcloud nicht erreichbar/Timeout:** transienter Fehler (zählt nicht zum
+  permanenten Fehlerlimit): bis zu 5 Wiederholungen im 30-s-Abstand, danach bleibt die
+  Datei liegen und der nächste periodische Sweep versucht es erneut. Das OCR-Ergebnis
+  bleibt dabei im Cache. Bricht die Verbindung zwischen Upload und Löschen des Scans
+  weg, erkennt der nächste Versuch die bereits erfolgte Ablage und löscht nur noch.
 - **WebDAV-Auth-Fehler:** Connectivity-Check beim Start, klarer Fehlschlag mit Log.
 - **Ordner-Kollisionen/Fast-Duplikate:** Fuzzy-Match eines vorgeschlagenen neuen Ordners gegen die
   echten Kinder dieser Ebene — bei hoher Ähnlichkeit wird automatisch dorthin umgeleitet
@@ -377,8 +403,10 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
   unter `Dokumente/` liegt): strukturell und bedingungslos ausgeschlossen, unabhängig von
   `excluded_folders` — siehe Architektur-Diagramm oben.
 - **Nicht-ASCII-Dateinamen:** NFC-Normalisierung vor jedem Vergleich/WebDAV-Pfad.
-- **Große Batches:** eine `queue.Queue` + feste Worker-Zahl (Default 1), um CPU
-  (Tesseract) und LLM (Ollama) auf bescheidener Hardware nicht zu überlasten.
+- **Große Batches:** zwei Stufen mit fester Thread-Zahl (OCR: `MAX_CONCURRENT_JOBS`,
+  Default 1; LLM: immer 1), damit CPU (Tesseract) und GPU (Ollama) parallel, aber nie
+  mehrfach belegt sind. Wird eine Datei aus dem Eingang genommen, während sie auf die
+  LLM-Stufe wartet, wird sie still übersprungen.
 
 ## Verifikation / Testplan
 
@@ -398,7 +426,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (234 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (260 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

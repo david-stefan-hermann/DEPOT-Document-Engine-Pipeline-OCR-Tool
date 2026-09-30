@@ -21,6 +21,11 @@ _PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
 """
 
 
+class PreconditionFailed(RuntimeError):
+    """A conditional request (PUT with If-None-Match: *) was refused because
+    the target already exists."""
+
+
 @dataclass(frozen=True)
 class Entry:
     path: str  # relative to the WebDAV root, no leading/trailing slash
@@ -163,8 +168,15 @@ class WebDavClient:
             )
         return resp.content
 
-    def put(self, rel_path: str, data: bytes) -> None:
-        resp = self._client.put(self._url_for(rel_path), content=data)
+    def put(self, rel_path: str, data: bytes, overwrite: bool = True) -> None:
+        """Upload a file. With overwrite=False the server refuses to replace
+        an existing file (If-None-Match: *) and PreconditionFailed is
+        raised instead - the guard against two writers picking the same
+        name at the same moment."""
+        headers = {} if overwrite else {"If-None-Match": "*"}
+        resp = self._client.put(self._url_for(rel_path), content=data, headers=headers)
+        if resp.status_code == 412 and not overwrite:
+            raise PreconditionFailed(f"PUT {rel_path!r}: a file with that name already exists")
         if resp.status_code not in (200, 201, 204):
             raise RuntimeError(
                 f"PUT {rel_path!r} failed: HTTP {resp.status_code} {resp.text[:300]}"
