@@ -1,6 +1,7 @@
 # DEPOT — Überarbeitungsplan: bessere Zuordnung, schnellere Verarbeitung
 
-Stand: 2026-09-30. Status: **Plan, noch nichts davon umgesetzt.** Ergänzt [plan.md](plan.md)
+Stand: 2026-09-30. Status: **Phase 0 und 1 umgesetzt (plus Duplikat-Erkennung), Phase 2–4
+offen** — siehe Abschnitt 5a für Ergebnis und Messwerte. Ergänzt [plan.md](plan.md)
 (Architektur-Ist-Stand) um eine priorisierte Überarbeitung. Grundlage sind nicht Vermutungen,
 sondern (a) der komplette Code, (b) die 31 echten Dateilog-Einträge aus dem Produktivbetrieb,
 (c) die tatsächlich abgelegten PDFs und (d) Live-Messungen gegen den echten Ollama-Server
@@ -198,6 +199,54 @@ Jede Phase ist einzeln deploybar. Reihenfolge nach Nutzen pro Aufwand.
 **Abnahme:** digitale PDFs bleiben byte-identisch und brauchen in der OCR-Stufe ~1 s statt
 25–600 s; `DATUM-UNSICHER`-Quote auf der Regressionsliste deutlich unter den heutigen 39 %;
 Eval-Kennzahlen nicht schlechter als Baseline; bestehende 133 Tests grün, neue Tests für 1.1–1.5.
+Ergebnis siehe 5a (195 Tests grün).
+
+### 5a. Stand nach Phase 0 + 1 (2026-09-30)
+
+Umgesetzt: alles aus Phase 0 und 1.1–1.9, dazu E3 (Original statt PDF, wenn kein Text erkannt
+wird) und E4 (Duplikate, vorgezogen aus 3.5). Abweichungen vom Plan:
+
+- **1.7:** `keep_alive=30m`, Vorladen parallel zum OCR und festes `num_ctx=8192` (liegt mit
+  4,99 GB weiter vollständig im VRAM) sind drin. Der wiederverwendete Client entfällt — eine
+  neue Verbindung pro Aufruf kostet im LAN nichts Messbares.
+- **Prompt-Reihenfolge (aus 2.4 vorgezogen) — mit einer wichtigen Korrektur:** "Dokumenttext
+  zuerst, Ebene zuletzt" in EINER Nachricht ließ das Modell bei 3 von 4 echten Dokumenten auf
+  der Wurzelebene "stay" antworten, die das alte Prompt richtig weiterleitete. Als zwei
+  Gesprächs-Turns (Dokument → kurze Bestätigung → Ebene) bleibt das wiederverwendbare Präfix
+  erhalten, ohne diesen Effekt. Aufgefallen ist das nur durch den Vorher/Nachher-Lauf von
+  `tools/eval.py` — Prompt-Änderungen ab jetzt immer so gegenprüfen.
+- **Eval-Werkzeug:** Leave-one-out ist noch nicht nötig (es gibt noch keinen Ordner-Index) und
+  kommt mit Phase 2. `--depot-path` vergleicht zwei Code-Stände auf denselben Dokumenten.
+
+**Vorher/Nachher, lokaler Pfad** — 30 zufällig gezogene, von Hand einsortierte PDFs aus dem
+echten Baum (165 Kandidaten-Ordner), neutraler Dateiname `scan.pdf`, gleiche Dokumente:
+
+| Kennzahl | vorher | nach Phase 1 |
+|---|---|---|
+| exakter Ordner | 6 / 30 (20 %) | **13 / 30 (43 %)** |
+| höchstens eine Ebene daneben | 1 | 1 |
+| richtiger Top-Level-Ordner | 13 | 15 |
+| `Unsortiert` (unsicher) | 2 | 4 |
+| falsch bei hoher Konfidenz | 21 / 30 (70 %) | **12 / 30 (40 %)** |
+| Sekunden pro Dokument (nur LLM) | 14,8 | 14,3 |
+
+Einordnung: deutlich besser, aber 30 Dokumente sind eine kleine Stichprobe, und ein Dokument
+wurde schlechter (vorher exakt, jetzt `Unsortiert`). Der Maßstab ist streng — als richtig zählt
+nur genau der Ordner, in dem das Dokument liegt, auch wenn er fünf Ebenen tief ist. Trotzdem:
+**der lokale Pfad ist mit 40 % "falsch bei hoher Konfidenz" noch nicht gut genug**, und die
+verbleibenden Fehler haben fast alle dieselbe Ursache — die erste Entscheidung auf der
+Wurzelebene fällt nur anhand von Ordnernamen (typisch: ein Versicherungsdokument zu einem
+Fahrzeug landet im allgemeinen Versicherungs-Ordner statt beim Fahrzeug, wo alle
+gleichartigen Dokumente bereits liegen). Genau das adressiert Phase 2 mit dem Ordner-Index.
+Die Zeit pro Dokument ist kaum gesunken, weil der Abstieg jetzt häufiger tiefer geht statt
+früh stehen zu bleiben; der Präfix-Cache spart pro weiterem Schritt, die Extraktion (~10 s)
+dominiert.
+
+Nicht geprüft werden konnte der OCR-Pfad mit echtem Tesseract (auf dem Entwicklungsrechner
+nicht installiert) — die Tests ersetzen den ocrmypdf-Aufruf. Der Fast-Path für digitale PDFs
+ist an echten Dateien geprüft (7 Seiten: 0,02 s, Original unverändert). **Nach dem Deploy auf
+dem Server gegenprüfen:** ein Scanner-PDF, ein digitales PDF, ein Foto; die Dateilog-Zeile
+zeigt jetzt `ocr=… llm=… dav=…`.
 
 ### Phase 2 — Zuordnung neu aufbauen
 
@@ -214,15 +263,16 @@ Eval-Kennzahlen nicht schlechter als Baseline; bestehende 133 Tests grün, neue 
 - **2.4 Ein gemeinsames Prompt-Präfix** für Extraktion und Entscheidung: gleiches System-Prompt,
   Dokumenttext zuerst, Aufgabe zuletzt. Die Entscheidung bekommt so den vollen Inhalt praktisch
   kostenlos (gemessen: 0,1 s statt 4,6 s Prompt-Auswertung) — Titel **und** Inhalt, wie
-  gewünscht. Das System-Prompt dabei straffen (heute ~1450 Token).
+  gewünscht. Das System-Prompt dabei straffen (heute ~1450 Token). Achtung, siehe 5a: die
+  Aufgabe muss ein eigener Gesprächs-Turn sein, und jede Variante wird per Eval gegengeprüft.
 - **2.5 Konfidenz aus Signalen**: hoch, wenn Absender-Historie eindeutig und Modellwahl
   übereinstimmend; gedeckelt bei Widerspruch, neuem Ordner, leerem Absender oder nur
   Dateiname als Grundlage. Schwelle anhand der Eval-Daten kalibrieren statt fest 0.6.
-- **2.6 Cloud-Pfad** nutzt dieselbe Kandidatenliste und dieselben Signale; Umfang der
-  gesendeten Daten siehe E1, Einsatzmodus siehe E2.
-- **Abnahme:** Eval — exakter Ordner und "falsch bei hoher Konfidenz" klar besser als Baseline;
-  der bekannte Fall "Absender ohne eigenen Ordner" landet lokal richtig; LLM-Zeit lokal
-  ≈ 10–12 s statt ≈ 29 s pro Dokument.
+- **2.6 Cloud-Pfad** nutzt dieselben Signale, soweit E1 sie erlaubt (keine Namen abgelegter
+  Dateien). Kein Eskalations-Modus (E2): Maßstab für Phase 2 ist der lokale Pfad allein.
+- **Abnahme:** Eval auf größerer Stichprobe (≥ 100 Dokumente, Leave-one-out) — exakter Ordner
+  und "falsch bei hoher Konfidenz" klar besser als der Stand aus 5a (43 % / 40 %); der bekannte
+  Fall "Absender ohne eigenen Ordner" landet lokal richtig; LLM-Zeit ≈ 10–12 s pro Dokument.
 
 ### Phase 3 — Durchsatz und Robustheit
 
@@ -234,7 +284,8 @@ Eval-Kennzahlen nicht schlechter als Baseline; bestehende 133 Tests grün, neue 
   `--jobs`, Sprache `deu+eng`. Jeweils Zeit und Texterkennung auf Beispielscans vergleichen.
 - **3.4 Periodischer Sweep** (z.B. alle 10 min) holt liegengebliebene Dateien und echte
   Wiederholungsversuche nach; Quarantäne nach 3 Versuchen bleibt.
-- **3.5 Duplikat-Erkennung** per Inhalts-Hash in der vorhandenen sqlite-DB (Verhalten siehe E4).
+- **3.5 Duplikat-Erkennung** per Inhalts-Hash in der vorhandenen sqlite-DB — bereits umgesetzt
+  (siehe E4).
 - **3.6 Ablage schlanker**: Kollisionsprüfung über den Mount bzw. `If-None-Match: *` statt
   Verzeichnis-Listing.
 
@@ -259,20 +310,20 @@ Eval-Kennzahlen nicht schlechter als Baseline; bestehende 133 Tests grün, neue 
 Die Zeilen zu OCR-Dauern nach dem Umbau sind Schätzungen aus dem Mechanismus; die LLM-Zeiten
 beruhen auf den Messungen in Abschnitt 2. Phase 0 liefert die echten Vorher/Nachher-Zahlen.
 
-## 7. Offene Entscheidungen
+## 7. Entscheidungen (vom Nutzer getroffen, 2026-09-30)
 
-- **E1 — Was darf an die Cloud gehen?** Heute: Absender, Titel, Ordnerpfade. Vorschlag:
-  zusätzlich Dateiname/PDF-Titel und lokal erzeugte Stichworte (kein OCR-Volltext). Noch offen:
-  Beispiel-Dateinamen aus den Kandidaten-Ordnern mitsenden? Das verbessert die Wahl am
-  stärksten, verrät aber Namen bereits abgelegter Dokumente. Empfehlung: Dateiname + Stichworte
-  ja, Beispiel-Dateinamen nein (stattdessen nur Absendernamen je Ordner).
-- **E2 — Cloud als Dauer-Schalter oder nur als Eskalation?** Empfehlung: neuer Modus
-  "nur wenn lokal unsicher" — nach Phase 2 sollte lokal der Normalfall reichen; die Cloud sieht
-  dann nur noch die Zweifelsfälle.
-- **E3 — Fotos ohne erkennbaren Text:** weiter in PDF umwandeln oder als Originalbild
-  ablegen? Empfehlung: Originalbild behalten (keine Entzerrung/Neukodierung eines Fotos).
-- **E4 — Duplikate:** überspringen und nur loggen, oder mit Tag `DUPLIKAT` nach `Unsortiert`?
-  Empfehlung: nach `Unsortiert` mit Tag — nichts verschwindet stillschweigend.
+- **E1 — Was darf an die Cloud gehen?** Zusätzlich zu Absender, Titel und Ordnerpfaden jetzt
+  auch der vom Nutzer vergebene Dateiname, der PDF-Titel und lokal erzeugte Stichworte.
+  Weiterhin nie: OCR-Volltext, Namen bereits abgelegter Dateien. Umgesetzt in Phase 1.
+- **E2 — Keine Cloud-Eskalation.** Es kommt kein Automatismus hinzu, der unsichere Fälle an
+  die Cloud schickt. Ziel von Phase 2 ist, dass der lokale Pfad allein ausreicht; der
+  bestehende, von Hand gesetzte Schalter `use_anthropic_classifier` bleibt unverändert.
+- **E3 — Fotos ohne erkennbaren Text** werden als Originalbild abgelegt, nicht als PDF.
+  Umgesetzt in Phase 1 (gilt ebenso für PDFs, in denen kein Text erkannt wurde).
+- **E4 — Duplikate** (byte-gleicher Scan, dessen Erstablage noch an ihrem Ort liegt) gehen mit
+  Tag `DUPLIKAT` nach `Unsortiert` und tragen `(Duplikat)` im Dateinamen; kein erneutes
+  OCR/LLM. Wurde die Erstablage inzwischen gelöscht oder verschoben, wird normal neu
+  verarbeitet. Umgesetzt (vorgezogen aus Phase 3.5).
 
 ## 8. Bewusst nicht geplant
 

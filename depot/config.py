@@ -48,6 +48,12 @@ class Config:
 
     supported_extensions: frozenset[str]
 
+    # Read the Dokumente/ folder tree from the local read-only mount when it
+    # covers it (far faster than one WebDAV request per folder). Set to
+    # false if parts of the tree don't exist on that mount (external
+    # storages, shares), so the listing falls back to WebDAV.
+    use_local_folder_listing: bool = True
+
     @classmethod
     def from_env(cls) -> "Config":
         # Resolved ahead of the other defaults below since ERROR_FOLDER's own
@@ -96,4 +102,6 @@ class Config:
             supported_extensions=frozenset(
                 {".pdf", ".jpg", ".jpeg", ".png", ".tif", ".tiff"}
             ),
+            use_local_folder_listing=os.environ.get("USE_LOCAL_FOLDER_LISTING", "true").strip().lower()
+            not in ("0", "false", "no", "off"),
         )

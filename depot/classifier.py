@@ -9,7 +9,12 @@ import anthropic
 import ollama
 from pydantic import ValidationError
 
-from depot.models import AnthropicFolderDecision, ContentExtraction, FolderStepDecision
+from depot.models import (
+    AnthropicFolderDecision,
+    ContentExtraction,
+    FolderStepDecision,
+    extraction_json_schema,
+)
 from depot.naming import closest_existing_leaf
 
 log = logging.getLogger(__name__)
@@ -23,7 +28,19 @@ MAX_OCR_CHARS = 3500
 # temperature=0 + a fixed seed). Since there is no benefit to creative
 # variation here - a given document should always file the same way - both
 # calls use fully deterministic sampling.
-_OLLAMA_OPTIONS = {"temperature": 0.0, "seed": 42}
+#
+# num_ctx is pinned rather than left to the server default (4096 when this
+# was written): the extraction prompt alone measured ~2900 tokens, and a
+# prompt that outgrows the context is silently truncated by Ollama. 8192
+# was verified to still sit fully in VRAM on the 6 GB card (4.99 GB). It
+# must be identical for every call - Ollama reloads the model (~5 s)
+# whenever it changes.
+_OLLAMA_OPTIONS = {"temperature": 0.0, "seed": 42, "num_ctx": 8192}
+
+# How long Ollama keeps the model in memory after a call. The server default
+# (5 min) meant the first document of nearly every batch paid a measured
+# ~11 s model load.
+OLLAMA_KEEP_ALIVE = "30m"
 
 # Above this similarity ratio, a proposed folder name is treated as referring
 # to an already-existing sibling (e.g. "Rechnung" vs "Rechnungen") and gets
@@ -125,6 +142,10 @@ Deutsche Datumsangaben im Text sind TT.MM.JJJJ (Tag zuerst) - wandle sie \
 sorgfaeltig um, ohne Ziffern zu vertauschen. Beispiel: "31.07.2026" im Text \
 bedeutet issue_date "2026-07-31" (Jahr-Monat-Tag), NICHT "3107-07-20" oder \
 aehnliche Vertauschungen.
+- "keywords" sind 3 bis 6 allgemeine Stichworte zu Dokumentart und Thema \
+(z.B. ["Rechnung", "Strom", "Jahresabrechnung"]), die helfen, das Dokument \
+einer Ablage-Kategorie zuzuordnen. KEINE personenbezogenen Angaben: keine \
+Personennamen, Adressen, Nummern, Betraege oder Datumsangaben.
 - "confidence" ist deine eigene Einschaetzung (0.0-1.0), wie sicher du bei \
 Titel UND Datum bist. Sei ehrlich niedrig, wenn der Text schlecht lesbar \
 oder mehrdeutig ist.
@@ -135,9 +156,12 @@ _ANTHROPIC_FOLDER_SYSTEM_PROMPT = """\
 Du sortierst ein gescanntes Dokument in eine bestehende, handgepflegte \
 Nextcloud-Ordnerstruktur ein.
 
-Du bekommst NUR: den extrahierten Absender, den Titel, und die \
-VOLLSTAENDIGE flache Liste aller existierenden Ordnerpfade - bewusst KEINEN \
-Dokumentinhalt (Datenschutz: der eigentliche Dokumenttext bleibt lokal).
+Du bekommst NUR: den extrahierten Absender, den Titel, ggf. den Dateinamen \
+bzw. PDF-Titel, den der Nutzer/Aussteller dem Dokument gegeben hat, ein \
+paar allgemeine Stichworte zum Thema, und die VOLLSTAENDIGE flache Liste \
+aller existierenden Ordnerpfade - bewusst KEINEN Dokumentinhalt \
+(Datenschutz: der eigentliche Dokumenttext bleibt lokal). Fehlt der \
+Absender, stuetze dich auf Dateiname, PDF-Titel und Stichworte.
 
 Antworte als JSON:
 - "action": "existing" wenn ein vorhandener Ordner aus der Liste wirklich \
@@ -161,7 +185,11 @@ Du hilfst dabei, ein gescanntes Dokument in eine bestehende, handgepflegte \
 Nextcloud-Ordnerstruktur einzusortieren - Schritt fuer Schritt, eine Ebene \
 nach der anderen.
 
-Du bekommst die AKTUELLE Ordner-Ebene und deren direkte Unterordner. \
+Du bekommst den erkannten Text, den urspruenglichen Dateinamen, den bereits \
+ermittelten Absender und Titel des Dokuments sowie die AKTUELLE Ordner-Ebene \
+und deren direkte Unterordner. Nutze Titel, Absender und Dateiname ZUSAMMEN \
+mit dem Text; ist kein Text vorhanden (z.B. bei einem Foto), entscheide \
+allein anhand von Titel und Dateiname. \
 Entscheide NUR, was auf DIESER Ebene als naechstes passiert:
 - "descend": einer der angebotenen Unterordner passt eindeutig besser als \
 die aktuelle Ebene - dann geht es dort eine Ebene tiefer weiter. \
@@ -183,11 +211,14 @@ EINEN Entscheidung bist.
 """
 
 
-def _build_content_messages(ocr_text: str, original_filename: str) -> list[dict]:
+def _build_content_messages(
+    ocr_text: str, original_filename: str, pdf_title: str | None = None
+) -> list[dict]:
     truncated_text = ocr_text[:MAX_OCR_CHARS]
+    pdf_title_line = f"\nTitel laut PDF-Metadaten: {pdf_title}" if pdf_title else ""
     user_prompt = f"""\
 Urspruenglicher Dateiname des Scans (kann bereits ein Hinweis auf Inhalt/Datum sein):
-{original_filename}
+{original_filename}{pdf_title_line}
 
 Erkannter Text (OCR, ggf. gekuerzt):
 ---
@@ -201,26 +232,50 @@ Erkannter Text (OCR, ggf. gekuerzt):
 
 
 def _build_folder_step_messages(
-    ocr_text: str, original_filename: str, current_path: str, children: list[str]
+    ocr_text: str,
+    original_filename: str,
+    current_path: str,
+    children: list[str],
+    title: str = "",
+    correspondent: str = "",
+    pdf_title: str | None = None,
 ) -> list[dict]:
     children_list = "\n".join(f"- {c}" for c in sorted(children)) or "(keine Unterordner vorhanden)"
-    truncated_text = ocr_text[:MAX_OCR_CHARS]
-    user_prompt = f"""\
-Aktuelle Ebene: {current_path}
-Direkte Unterordner dieser Ebene:
-{children_list}
-
-Urspruenglicher Dateiname des Scans:
-{original_filename}
+    truncated_text = ocr_text[:MAX_OCR_CHARS] or "(kein Text erkannt)"
+    pdf_title_line = f"Titel laut PDF-Metadaten: {pdf_title}\n" if pdf_title else ""
+    # Order matters for speed: everything that stays the same for one
+    # document across all steps of the walk (the long text) comes before the
+    # part that changes per step, so Ollama reuses the already evaluated
+    # prefix - measured ~0.1 s instead of ~4.6 s prompt evaluation for every
+    # step after the first.
+    #
+    # It is split into two turns on purpose. Simply appending the level to
+    # the document in ONE message made the model answer "stay" at the root
+    # for 3 of 4 real documents that the old level-first prompt routed
+    # correctly; as a separate final turn it decided like the old prompt
+    # again. Don't merge these without re-running tools/eval.py.
+    document_prompt = f"""\
+Hier ist das Dokument, das einsortiert werden soll.
 
 Erkannter Text (OCR, ggf. gekuerzt):
 ---
 {truncated_text}
 ---
+
+Urspruenglicher Dateiname des Scans: {original_filename}
+{pdf_title_line}Absender des Dokuments: {correspondent or "(nicht erkannt)"}
+Titel des Dokuments: {title or "(nicht ermittelt)"}
+"""
+    level_prompt = f"""\
+Aktuelle Ebene: {current_path}
+Direkte Unterordner dieser Ebene:
+{children_list}
 """
     return [
         {"role": "system", "content": _FOLDER_STEP_SYSTEM_PROMPT},
-        {"role": "user", "content": user_prompt},
+        {"role": "user", "content": document_prompt},
+        {"role": "assistant", "content": "Verstanden. Nenne mir die aktuelle Ebene und ihre Unterordner."},
+        {"role": "user", "content": level_prompt},
     ]
 
 
@@ -237,22 +292,53 @@ def _children_of(existing_folders: list[str], parent: str) -> list[str]:
     return sorted(children)
 
 
+def _chat(label: str, ollama_host: str, model: str, messages: list[dict], schema: dict, timeout: float) -> str:
+    client = ollama.Client(host=ollama_host, timeout=timeout)
+    response = client.chat(
+        model=model,
+        messages=messages,
+        format=schema,
+        options=_OLLAMA_OPTIONS,
+        keep_alive=OLLAMA_KEEP_ALIVE,
+    )
+    ns = 1e9
+    log.info(
+        "ollama %s: load=%.1fs prompt=%s tok/%.1fs output=%s tok/%.1fs",
+        label,
+        (response.get("load_duration") or 0) / ns,
+        response.get("prompt_eval_count"),
+        (response.get("prompt_eval_duration") or 0) / ns,
+        response.get("eval_count"),
+        (response.get("eval_duration") or 0) / ns,
+    )
+    return response["message"]["content"]
+
+
+def preload_model(ollama_host: str, model: str, timeout: float = 120.0) -> None:
+    """Asks Ollama to load the model without generating anything, so a cold
+    model loads while OCR is still running instead of afterwards. Best
+    effort only - a failure here just means the first real call loads it."""
+    try:
+        ollama.Client(host=ollama_host, timeout=timeout).generate(
+            model=model,
+            prompt="",
+            options={"num_ctx": _OLLAMA_OPTIONS["num_ctx"]},
+            keep_alive=OLLAMA_KEEP_ALIVE,
+        )
+    except Exception as exc:
+        log.debug("Model preload failed (ignored): %s", exc)
+
+
 def extract_content(
     ocr_text: str,
     original_filename: str,
     ollama_host: str,
     model: str,
     timeout: float = 120.0,
+    pdf_title: str | None = None,
 ) -> ContentExtraction:
-    client = ollama.Client(host=ollama_host, timeout=timeout)
-    messages = _build_content_messages(ocr_text, original_filename)
-    response = client.chat(
-        model=model,
-        messages=messages,
-        format=ContentExtraction.model_json_schema(),
-        options=_OLLAMA_OPTIONS,
-    )
-    raw_content = response["message"]["content"]
+    messages = _build_content_messages(ocr_text, original_filename, pdf_title)
+    raw_content = _chat("extract", ollama_host, model, messages, extraction_json_schema(), timeout)
     try:
         payload = json.loads(raw_content)
         return ContentExtraction.model_validate(payload)
@@ -268,16 +354,16 @@ def _decide_folder_step(
     ollama_host: str,
     model: str,
     timeout: float = 120.0,
+    title: str = "",
+    correspondent: str = "",
+    pdf_title: str | None = None,
 ) -> FolderStepDecision:
-    client = ollama.Client(host=ollama_host, timeout=timeout)
-    messages = _build_folder_step_messages(ocr_text, original_filename, current_path, children)
-    response = client.chat(
-        model=model,
-        messages=messages,
-        format=FolderStepDecision.model_json_schema(),
-        options=_OLLAMA_OPTIONS,
+    messages = _build_folder_step_messages(
+        ocr_text, original_filename, current_path, children, title, correspondent, pdf_title
     )
-    raw_content = response["message"]["content"]
+    raw_content = _chat(
+        "folder-step", ollama_host, model, messages, FolderStepDecision.model_json_schema(), timeout
+    )
     try:
         payload = json.loads(raw_content)
         return FolderStepDecision.model_validate(payload)
@@ -294,6 +380,8 @@ def _walk_folder_tree(
     model: str,
     timeout: float = 120.0,
     correspondent: str = "",
+    title: str = "",
+    pdf_title: str | None = None,
 ) -> tuple[str, bool, float, list[str]]:
     """Descends the Dokumente/ tree one level at a time, asking the model at
     each level to pick a direction from a small, focused candidate set
@@ -320,7 +408,8 @@ def _walk_folder_tree(
             break  # leaf reached, nothing to ask about
 
         decision = _decide_folder_step(
-            ocr_text, original_filename, current_path, children, ollama_host, model, timeout
+            ocr_text, original_filename, current_path, children, ollama_host, model, timeout,
+            title=title, correspondent=correspondent, pdf_title=pdf_title,
         )
         confidences.append(decision.confidence)
 
@@ -363,13 +452,25 @@ def _walk_folder_tree(
 
 
 def _build_anthropic_folder_user_content(
-    correspondent: str, title: str, existing_folders: list[str]
+    correspondent: str,
+    title: str,
+    existing_folders: list[str],
+    filename_title: str | None = None,
+    pdf_title: str | None = None,
+    keywords: list[str] | tuple[str, ...] = (),
 ) -> str:
     folder_list = "\n".join(sorted(existing_folders)) or "(keine Ordner vorhanden)"
+    extra = ""
+    if filename_title:
+        extra += f"Dateiname des Scans: {filename_title}\n"
+    if pdf_title:
+        extra += f"PDF-Titel: {pdf_title}\n"
+    if keywords:
+        extra += f"Stichworte: {', '.join(keywords)}\n"
     return f"""\
 Absender: {correspondent or "(kein Absender erkannt)"}
 Titel: {title}
-
+{extra}
 Vollstaendige Liste existierender Ordner ({len(existing_folders)} Stueck):
 {folder_list}
 """
@@ -383,14 +484,18 @@ def classify_folder_via_anthropic(
     anthropic_api_key: str | None,
     anthropic_model: str,
     timeout: float = 60.0,
+    filename_title: str | None = None,
+    pdf_title: str | None = None,
+    keywords: list[str] | tuple[str, ...] = (),
 ) -> tuple[str, bool, float, list[str]]:
     """Single-shot cloud classification: unlike _walk_folder_tree, hands the
     WHOLE existing folder tree to the model in one call instead of walking
     it level by level - a frontier model doesn't need the small-model
     workaround that hierarchical descent exists for. Sends ONLY
-    correspondent + title + the folder-path list, never the OCR text or
-    original filename, so the actual document content never leaves the
-    local network.
+    correspondent + title + the folder-path list, plus (when available) the
+    name the user gave the file, the PDF's metadata title and a few locally
+    generated general topic keywords - never the OCR text, so the actual
+    document content never leaves the local network.
 
     On ANY failure (no API key configured, network error, rate limit,
     invalid response), returns confidence=0.0 instead of raising, so the
@@ -404,7 +509,9 @@ def classify_folder_via_anthropic(
 
     try:
         client = anthropic.Anthropic(api_key=anthropic_api_key, timeout=timeout)
-        user_content = _build_anthropic_folder_user_content(correspondent, title, existing_folders)
+        user_content = _build_anthropic_folder_user_content(
+            correspondent, title, existing_folders, filename_title, pdf_title, keywords
+        )
         # No temperature/seed knob here (unlike _OLLAMA_OPTIONS above):
         # current-generation Claude models removed sampling parameters from
         # the API entirely (confirmed against the installed SDK - `create`/
@@ -462,16 +569,21 @@ def classify_via_anthropic(
     anthropic_model: str,
     dokumente_root: str = "Dokumente",
     timeout: float = 120.0,
+    content: ContentExtraction | None = None,
+    filename_title: str | None = None,
+    pdf_title: str | None = None,
 ) -> tuple[ClassificationOutcome, list[str]]:
     """Same contract as classify(), but the folder decision is delegated to
     Anthropic (classify_folder_via_anthropic) instead of the local
     hierarchical walk. title/correspondent/issue_date extraction still runs
-    fully locally via extract_content() - only correspondent+title+folder
-    names ever reach the cloud call."""
-    content = extract_content(ocr_text, original_filename, ollama_host, model, timeout)
+    fully locally via extract_content() - see classify_folder_via_anthropic
+    for exactly what reaches the cloud call."""
+    if content is None:
+        content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title)
     folder, is_new_folder, folder_confidence, tags = classify_folder_via_anthropic(
         content.correspondent, content.title, existing_folders, dokumente_root,
         anthropic_api_key, anthropic_model,
+        filename_title=filename_title, pdf_title=pdf_title, keywords=content.keywords,
     )
     overall_confidence = min(content.confidence, folder_confidence)
     outcome = ClassificationOutcome(
@@ -493,16 +605,23 @@ def classify(
     model: str,
     dokumente_root: str = "Dokumente",
     timeout: float = 120.0,
+    content: ContentExtraction | None = None,
+    pdf_title: str | None = None,
 ) -> tuple[ClassificationOutcome, list[str]]:
     """Classifies one document: extracts title/date independently of the
     folder structure, then walks the Dokumente/ tree level by level to find
     (or create) the right destination folder. Raises on infrastructure
     failures (unreachable Ollama, invalid response) so the caller can treat
-    those as transient and retry/fallback accordingly."""
-    content = extract_content(ocr_text, original_filename, ollama_host, model, timeout)
+    those as transient and retry/fallback accordingly.
+
+    Pass `content` to skip the extraction call when title/correspondent are
+    already known some other way (e.g. taken from the filename because OCR
+    found no text)."""
+    if content is None:
+        content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title)
     folder, is_new_folder, folder_confidence, tags = _walk_folder_tree(
         ocr_text, original_filename, existing_folders, dokumente_root, ollama_host, model, timeout,
-        correspondent=content.correspondent,
+        correspondent=content.correspondent, title=content.title, pdf_title=pdf_title,
     )
     overall_confidence = min(content.confidence, folder_confidence)
     outcome = ClassificationOutcome(

@@ -147,3 +147,53 @@ def test_anthropic_folder_decision_confidence_percentage_is_rescaled():
         {"action": "existing", "folder": "Dokumente", "confidence": 85}
     )
     assert result.confidence == 0.85
+
+
+# ---- keywords / schema -------------------------------------------------------
+
+def test_content_keywords_default_to_empty():
+    result = ContentExtraction.model_validate({"title": "Y", "correspondent": "", "confidence": 0.5})
+    assert result.keywords == []
+
+
+def test_content_keywords_drop_anything_that_is_not_a_plain_topic_word():
+    """Keywords may be sent to the cloud classifier - numbers (customer ids,
+    amounts, dates) and overlong phrases are dropped, not trusted to the
+    prompt alone."""
+    result = ContentExtraction.model_validate(
+        {
+            "title": "Y",
+            "correspondent": "",
+            "confidence": 0.5,
+            "keywords": [
+                " Rechnung ", "Strom", "Strom", "Kundennummer 4711", "12.08.2026", "x" * 60,
+                "Jahresabrechnung", "Energie", "Abschlag", "Zaehler", "Tarif",
+            ],
+        }
+    )
+    assert result.keywords == ["Rechnung", "Strom", "Jahresabrechnung", "Energie", "Abschlag", "Zaehler"]
+
+
+def test_content_keywords_of_wrong_type_become_empty():
+    result = ContentExtraction.model_validate(
+        {"title": "Y", "correspondent": "", "confidence": 0.5, "keywords": "Rechnung"}
+    )
+    assert result.keywords == []
+
+
+def test_extraction_schema_requires_keywords_from_the_model():
+    from depot.models import extraction_json_schema
+
+    schema = extraction_json_schema()
+    assert "keywords" in schema["required"]
+    assert "correspondent" in schema["required"]
+
+
+def test_content_date_more_than_a_few_days_ahead_is_discarded():
+    from datetime import date, timedelta
+
+    soon = (date.today() + timedelta(days=30)).isoformat()
+    result = ContentExtraction.model_validate(
+        {"title": "Wahlbenachrichtigung", "correspondent": "", "issue_date": soon, "confidence": 0.9}
+    )
+    assert result.issue_date is None

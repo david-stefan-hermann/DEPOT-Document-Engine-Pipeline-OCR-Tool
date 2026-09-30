@@ -37,3 +37,17 @@ def test_persists_across_reconnect(tmp_path):
     store2 = StateStore(db_path)
     assert store2.increment_failure("scan.pdf") == 2
     store2.close()
+
+
+def test_processed_hash_is_remembered_across_reconnect(tmp_path):
+    db_path = str(tmp_path / "state.sqlite3")
+    store1 = StateStore(db_path)
+    assert store1.find_processed("abc") is None
+    store1.record_processed("abc", "Dokumente/A/x.pdf")
+    store1.close()
+
+    store2 = StateStore(db_path)
+    assert store2.find_processed("abc") == "Dokumente/A/x.pdf"
+    store2.record_processed("abc", "Dokumente/B/x.pdf")
+    assert store2.find_processed("abc") == "Dokumente/B/x.pdf"
+    store2.close()

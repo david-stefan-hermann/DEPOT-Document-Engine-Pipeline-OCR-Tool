@@ -336,7 +336,7 @@ def test_new_folder_is_immediately_visible_to_next_document(monkeypatch, tmp_pat
     monkeypatch.setattr(classifier, "classify", fake_classify)
 
     scan1 = _make_scan(tmp_path, name="scan1.pdf")
-    scan2 = _make_scan(tmp_path, name="scan2.pdf")
+    scan2 = _make_scan(tmp_path, name="scan2.pdf", content=b"%PDF-another-raw-scan")
     _seed_source_on_server(pipeline, client, scan1)
     _seed_source_on_server(pipeline, client, scan2)
 
@@ -476,7 +476,7 @@ def test_switch_takes_effect_on_next_document_without_restart(monkeypatch, tmp_p
     behavior for the very next scan, no container restart needed."""
     p = _make_pipeline(tmp_path, client)
     scan1 = _make_scan(tmp_path, name="scan1.pdf")
-    scan2 = _make_scan(tmp_path, name="scan2.pdf")
+    scan2 = _make_scan(tmp_path, name="scan2.pdf", content=b"%PDF-another-raw-scan")
     _seed_source_on_server(p, client, scan1)
     _seed_source_on_server(p, client, scan2)
     ocr_pdf = _make_ocr_pdf(tmp_path)
@@ -547,4 +547,306 @@ def test_use_anthropic_classifier_switch_routes_to_cloud_folder_decision(monkeyp
     filed = [f for f in fake_server.files if f.startswith("Dokumente/Gesundheit/")]
     assert len(filed) == 1
     p.state.close()
+
+
+# ---- title signals: filename / PDF metadata ------------------------------
+
+def _ocr_failed(path, language):
+    return OcrResult(text="", page_count=1, ocr_pdf_path=str(path), ocr_failed=True)
+
+
+def test_ocr_failure_with_descriptive_filename_is_classified_by_its_name(
+    monkeypatch, tmp_path, pipeline, fake_server, client
+):
+    """Real case: photos named by the user ("motorrad anhänger ...jpg") went
+    to Unsortiert unclassified because OCR found no text. The name the user
+    gave the file is the document's title and is enough to file it by."""
+    scan = _make_scan(tmp_path, name="2026-09-25 Blitzerfoto.jpg", content=b"jpeg-bytes")
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _ocr_failed)
+
+    calls = []
+
+    def fake_classify(**kwargs):
+        calls.append(kwargs)
+        content = kwargs["content"]
+        return (
+            ClassificationOutcome(
+                folder="Dokumente/Auto", is_new_folder=False, title=content.title,
+                issue_date=content.issue_date, confidence=content.confidence,
+            ),
+            [],
+        )
+
+    monkeypatch.setattr(classifier, "classify", fake_classify)
+
+    pipeline.process_one(scan)
+
+    assert calls[0]["content"].title == "Blitzerfoto"
+    # original image kept as-is, named from the filename's own date + title
+    assert "Dokumente/Auto/2026-09-25 Blitzerfoto.jpg" in fake_server.files
+    assert fake_server.files["Dokumente/Auto/2026-09-25 Blitzerfoto.jpg"] == b"jpeg-bytes"
+    log_text = _get_log_text(fake_server, client)
+    assert "OCR-FEHLGESCHLAGEN" in log_text
+    assert "NUR-DATEINAME" in log_text
+    assert "DATUM-AUS-DATEINAME" in log_text
+    assert "DATUM-UNSICHER" not in log_text
+
+
+def test_ocr_failure_with_scanner_filename_still_goes_to_fallback(
+    monkeypatch, tmp_path, pipeline, fake_server, client
+):
+    scan = _make_scan(tmp_path, name="IMG_20260925_101500.jpg", content=b"jpeg-bytes")
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _ocr_failed)
+
+    def _should_not_be_called(**kwargs):
+        raise AssertionError("a machine-generated filename is no basis for classification")
+
+    monkeypatch.setattr(classifier, "classify", _should_not_be_called)
+
+    pipeline.process_one(scan)
+
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Unsortiert/")]) == 1
+
+
+def test_date_in_filename_is_used_when_model_finds_none(monkeypatch, tmp_path, pipeline, fake_server, client):
+    scan = _make_scan(tmp_path, name="Antrag, 28-09-2026 13-52-56.pdf")
+    _seed_source_on_server(pipeline, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="Versicherungsbedingungen ...", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **kwargs: (
+            ClassificationOutcome(folder="Dokumente/Versicherung", is_new_folder=False, title="Antrag", confidence=0.9),
+            [],
+        ),
+    )
+
+    pipeline.process_one(scan)
+
+    assert "Dokumente/Versicherung/2026-09-28 Antrag.pdf" in fake_server.files
+    assert "DATUM-AUS-DATEINAME" in _get_log_text(fake_server, client)
+
+
+def test_model_date_that_is_not_in_the_document_is_discarded(monkeypatch, tmp_path, pipeline, fake_server, client):
+    """The model has been seen blending digits of two dates on one form into
+    a date that occurs nowhere - such a date must not end up in the name."""
+    from datetime import date
+
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(
+            text="Eintritt 01.03.2024 Datum 21.08.2026", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False
+        ),
+    )
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **kwargs: (
+            ClassificationOutcome(
+                folder="Dokumente/Arbeit", is_new_folder=False, title="Abrechnung",
+                issue_date=date(2024, 8, 21), confidence=0.9,
+            ),
+            [],
+        ),
+    )
+
+    pipeline.process_one(scan)
+
+    filed = [p for p in fake_server.files if p.startswith("Dokumente/Arbeit/")]
+    assert len(filed) == 1
+    assert "(Datum unsicher)" in filed[0]
+    assert "2024-08-21" not in filed[0]
+
+
+def test_cloud_classifier_gets_filename_title_but_local_does_not_need_it(
+    monkeypatch, tmp_path, fake_server, client
+):
+    _write_processing_switches(tmp_path, use_anthropic_classifier=True)
+    p = _make_pipeline(tmp_path, client, anthropic_api_key="sk-ant-fake")
+    scan = _make_scan(tmp_path, name="Ende der Familienversicherung.pdf")
+    _seed_source_on_server(p, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+    calls = []
+
+    def fake_classify_via_anthropic(**kwargs):
+        calls.append(kwargs)
+        return (
+            ClassificationOutcome(folder="Dokumente/Gesundheit", is_new_folder=False, title="Ende", confidence=0.9),
+            [],
+        )
+
+    monkeypatch.setattr(classifier, "classify_via_anthropic", fake_classify_via_anthropic)
+
+    p.process_one(scan)
+
+    assert calls[0]["filename_title"] == "Ende der Familienversicherung"
     p.state.close()
+
+
+def test_log_line_contains_stage_timings(monkeypatch, tmp_path, pipeline, fake_server, client):
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    ocr_pdf = _make_ocr_pdf(tmp_path)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(ocr_pdf), ocr_failed=False),
+    )
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **kwargs: (
+            ClassificationOutcome(folder="Dokumente/Gesundheit", is_new_folder=False, title="Doc", confidence=0.9),
+            [],
+        ),
+    )
+
+    pipeline.process_one(scan)
+
+    log_text = _get_log_text(fake_server, client)
+    assert "ocr=" in log_text and "llm=" in log_text and "dav=" in log_text
+
+
+# ---- duplicates / double processing --------------------------------------
+
+def _classify_into(folder, title="Doc"):
+    return lambda **kwargs: (
+        ClassificationOutcome(folder=folder, is_new_folder=False, title=title, confidence=0.9),
+        [],
+    )
+
+
+def test_same_content_again_is_filed_as_marked_duplicate(monkeypatch, tmp_path, pipeline, fake_server, client):
+    """Real case: the same 130-page PDF was dropped in twice under slightly
+    different names and fully processed and filed twice ("... (2).pdf")."""
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(path), ocr_failed=False),
+    )
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Versicherung", title="Police"))
+
+    first = _make_scan(tmp_path, name="Police, Antrag.pdf", content=b"%PDF-same-bytes")
+    _seed_source_on_server(pipeline, client, first)
+    pipeline.process_one(first)
+    filed = [p for p in fake_server.files if p.startswith("Dokumente/Versicherung/")]
+    assert len(filed) == 1
+
+    def _must_not_run(*a, **k):
+        raise AssertionError("a duplicate must not be OCR'd or classified again")
+
+    monkeypatch.setattr(ocr, "process_file", _must_not_run)
+    monkeypatch.setattr(classifier, "classify", _must_not_run)
+
+    second = _make_scan(tmp_path, name="Police Antrag.pdf", content=b"%PDF-same-bytes")
+    _seed_source_on_server(pipeline, client, second)
+    pipeline.process_one(second)
+
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Versicherung/")]) == 1
+    duplicates = [p for p in fake_server.files if p.startswith("Dokumente/Unsortiert/")]
+    assert len(duplicates) == 1
+    assert "Police" in duplicates[0] and duplicates[0].endswith(" (Duplikat).pdf")
+    assert client.get(f"Scan-Eingang/{second.name}") is None
+    log_texts = [
+        client.get(p).decode("utf-8")
+        for p in fake_server.files if p.startswith("Scan-Eingang/Config/DEPOT Dateilog ")
+    ]
+    assert any("DUPLIKAT" in t and filed[0] in t for t in log_texts)
+
+
+def test_same_content_is_processed_normally_once_the_first_copy_is_gone(
+    monkeypatch, tmp_path, pipeline, fake_server, client
+):
+    """Deleting a misfiled document and dropping the scan in again must
+    re-process it, not flag it as a duplicate of something that's gone."""
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="text", page_count=1, ocr_pdf_path=str(path), ocr_failed=False),
+    )
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Falsch"))
+    first = _make_scan(tmp_path, name="brief.pdf", content=b"%PDF-same-bytes")
+    _seed_source_on_server(pipeline, client, first)
+    pipeline.process_one(first)
+    (filed,) = [p for p in fake_server.files if p.startswith("Dokumente/Falsch/")]
+
+    client.delete(filed)
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Richtig"))
+    _seed_source_on_server(pipeline, client, first)
+    pipeline.process_one(first)
+
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Richtig/")]) == 1
+    assert not any(p.startswith("Dokumente/Unsortiert/") for p in fake_server.files)
+
+
+def test_file_that_vanished_before_processing_is_skipped_silently(
+    monkeypatch, tmp_path, pipeline, fake_server, client
+):
+    """Real case: a file queued twice - the second run found it already
+    filed+deleted and logged a bogus "[Errno 2] No such file" failure."""
+    def _must_not_run(*a, **k):
+        raise AssertionError("nothing to process")
+
+    monkeypatch.setattr(ocr, "process_file", _must_not_run)
+
+    pipeline.process_one(tmp_path / "already-gone.pdf")
+
+    assert not any(p.startswith("Scan-Eingang/Config/DEPOT Dateilog ") for p in fake_server.files)
+    assert pipeline.state.should_quarantine("already-gone.pdf") is False
+
+
+# ---- folder listing from the local mount ----------------------------------
+
+def test_folder_listing_comes_from_local_mount_when_it_covers_the_tree(tmp_path, client):
+    mount = tmp_path / "mount"
+    (mount / "Dokumente" / "Scan Eingang" / "Depot Config").mkdir(parents=True)
+    (mount / "Dokumente" / "Gesundheit" / "Krankenkasse").mkdir(parents=True)
+    (mount / "Dokumente" / "Unsortiert").mkdir()
+
+    p = _make_pipeline(
+        tmp_path, client,
+        scan_eingang_local_path=str(mount / "Dokumente" / "Scan Eingang"),
+        scan_eingang_webdav_path="Dokumente/Scan Eingang",
+    )
+
+    def _no_webdav_listing(*a, **k):
+        raise AssertionError("the WebDAV tree walk must not be needed")
+
+    p.webdav.list_folders_recursive = _no_webdav_listing
+
+    folders = p._get_existing_folders()
+
+    assert sorted(folders) == ["Dokumente/Gesundheit", "Dokumente/Gesundheit/Krankenkasse"]
+    p.state.close()
+
+
+def test_upload_recovers_when_a_listed_folder_has_disappeared(monkeypatch, tmp_path, pipeline, fake_server, client):
+    """Folders known from the listing skip mkcol; if one was removed in the
+    meantime the upload must recreate it rather than fail."""
+    client.mkcol("Dokumente/Gesundheit")
+    pipeline._get_existing_folders()
+    fake_server.collections.discard("Dokumente/Gesundheit")
+
+    real_put = client.put
+    attempts = []
+
+    def put_failing_without_parent(rel_path, data):
+        attempts.append(rel_path)
+        if rel_path.startswith("Dokumente/Gesundheit/") and "Dokumente/Gesundheit" not in fake_server.collections:
+            raise RuntimeError("PUT failed: HTTP 409")
+        return real_put(rel_path, data)
+
+    pipeline.webdav.put = put_failing_without_parent
+
+    dest = pipeline._put_with_collision_resolution("Dokumente/Gesundheit", "a.pdf", b"x")
+
+    assert dest == "Dokumente/Gesundheit/a.pdf"
+    assert "Dokumente/Gesundheit" in fake_server.collections
+    assert fake_server.files[dest] == b"x"

@@ -6,13 +6,21 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
+from depot.signals import MAX_FUTURE_DAYS
+
 log = logging.getLogger(__name__)
 
-# A real document's issue date is essentially always in the past; allow a small
-# buffer for documents dated slightly ahead (e.g. subscription renewals) and
-# reject anything clearly implausible (OCR/model garbage like year 3107).
+# A real document's issue date is never meaningfully in the future (see
+# signals.MAX_FUTURE_DAYS); reject that and anything clearly implausible
+# (OCR/model garbage like year 3107).
 _MIN_PLAUSIBLE_DATE = date(1900, 1, 1)
-_MAX_FUTURE_BUFFER = timedelta(days=60)
+_MAX_FUTURE_BUFFER = timedelta(days=MAX_FUTURE_DAYS)
+
+# Hard limits on the locally generated keywords - they may be sent to the
+# cloud classifier, so anything that isn't a short plain topic word is
+# dropped rather than trusted to the prompt alone.
+_MAX_KEYWORDS = 6
+_MAX_KEYWORD_LENGTH = 40
 
 
 def _normalize_confidence_value(v: float | int) -> float:
@@ -40,11 +48,31 @@ class ContentExtraction(BaseModel):
     issue_date: date | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     reasoning: str = ""
+    # General topic/document-type words ("Rechnung", "Strom"), no personal
+    # data. Optional here so a filename-only extraction can be built
+    # without them, but forced to "required" in the schema handed to the
+    # model (see extraction_json_schema) for the same reason as
+    # `correspondent` above.
+    keywords: list[str] = Field(default_factory=list)
 
     @field_validator("confidence", mode="before")
     @classmethod
     def _normalize_confidence(cls, v: float | int) -> float:
         return _normalize_confidence_value(v)
+
+    @field_validator("keywords", mode="before")
+    @classmethod
+    def _clean_keywords(cls, v: object) -> list[str]:
+        if not isinstance(v, list):
+            return []
+        cleaned: list[str] = []
+        for item in v:
+            word = " ".join(str(item).split())
+            if not word or len(word) > _MAX_KEYWORD_LENGTH or any(ch.isdigit() for ch in word):
+                continue
+            if word not in cleaned:
+                cleaned.append(word)
+        return cleaned[:_MAX_KEYWORDS]
 
     @field_validator("title")
     @classmethod
@@ -65,6 +93,16 @@ class ContentExtraction(BaseModel):
             log.warning("Model returned an implausible issue_date %s; discarding it.", v)
             return None
         return v
+
+
+def extraction_json_schema() -> dict:
+    """ContentExtraction's JSON schema as given to the model, with
+    `keywords` marked required so the model actually fills it in."""
+    schema = ContentExtraction.model_json_schema()
+    required = schema.setdefault("required", [])
+    if "keywords" not in required:
+        required.append("keywords")
+    return schema
 
 
 class FolderStepDecision(BaseModel):
@@ -124,7 +162,12 @@ class OcrResult(BaseModel):
 
     text: str
     page_count: int
+    # The file to archive: a new searchable PDF when OCR ran, otherwise the
+    # untouched input (born-digital PDF, or nothing recognizable at all).
     ocr_pdf_path: str
     ocr_failed: bool
+    # True when the text came straight from the PDF's own text layer on
+    # every page, i.e. a born-digital document rather than a scan.
+    born_digital: bool = False
 
     model_config = {"arbitrary_types_allowed": True}

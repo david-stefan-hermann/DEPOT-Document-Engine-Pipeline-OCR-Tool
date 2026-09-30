@@ -48,7 +48,7 @@ def _decision(action, folder_name=None, confidence=0.9):
 def test_walk_descends_then_stays(monkeypatch):
     calls = []
 
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         calls.append(current_path)
         if current_path == "Dokumente":
             return _decision("descend", "Gesundheit", confidence=0.9)
@@ -72,7 +72,7 @@ def test_walk_never_visits_irrelevant_branch(monkeypatch):
     like Games/Amiibo is never even offered as a candidate."""
     seen_children = []
 
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         seen_children.append(children)
         return _decision("descend", "Gesundheit") if current_path == "Dokumente" else _decision("stay")
 
@@ -103,7 +103,7 @@ def test_walk_stops_at_leaf_without_llm_call(monkeypatch):
 
 
 def test_walk_corrects_near_duplicate_descend_choice(monkeypatch):
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         if current_path == "Dokumente":
             return _decision("descend", "Motorad")  # typo of "Motorrad"
         return _decision("stay")
@@ -131,7 +131,7 @@ def test_walk_treats_invalid_descend_as_stay(monkeypatch):
 
 
 def test_walk_creates_new_folder(monkeypatch):
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         return _decision("new_folder", "Versicherung", confidence=0.85)
 
     monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
@@ -145,7 +145,7 @@ def test_walk_creates_new_folder(monkeypatch):
 
 
 def test_walk_redirects_near_duplicate_new_folder_to_existing_sibling(monkeypatch):
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         return _decision("new_folder", "Rechnung")  # "Rechnungen" already exists under Motorrad... but we're at root
 
     monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
@@ -188,7 +188,7 @@ def test_walk_starts_at_correspondent_matched_folder(monkeypatch):
     straight there instead of gambling on the root-level category guess."""
     seen_levels = []
 
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         seen_levels.append(current_path)
         return _decision("stay", confidence=0.9)
 
@@ -212,7 +212,7 @@ def test_walk_starts_at_correspondent_matched_folder(monkeypatch):
 def test_walk_ignores_weak_correspondent_match(monkeypatch):
     seen_levels = []
 
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         seen_levels.append(current_path)
         return _decision("stay", confidence=0.9)
 
@@ -229,7 +229,7 @@ def test_walk_ignores_weak_correspondent_match(monkeypatch):
 def test_walk_without_correspondent_starts_at_root(monkeypatch):
     seen_levels = []
 
-    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0):
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
         seen_levels.append(current_path)
         return _decision("stay", confidence=0.9)
 
@@ -251,7 +251,7 @@ class _FakeClient:
     def __call__(self, *args, **kwargs):
         return self
 
-    def chat(self, model, messages, format, options):
+    def chat(self, model, messages, format, options, **kwargs):
         return {"message": {"content": json.dumps(self._payload)}}
 
 
@@ -273,7 +273,7 @@ def test_extract_content_parses_valid_response(monkeypatch):
 
 def test_extract_content_raises_on_invalid_json(monkeypatch):
     class BadClient:
-        def chat(self, model, messages, format, options):
+        def chat(self, model, messages, format, options, **kwargs):
             return {"message": {"content": "not json"}}
 
     monkeypatch.setattr(ollama, "Client", lambda *a, **k: BadClient())
@@ -509,3 +509,134 @@ def test_classify_via_anthropic_combines_content_and_cloud_folder_decision(monke
     assert calls[0][:2] == ("Techniker Krankenkasse", "Mitgliedsbescheinigung")
     assert calls[0][2] == EXISTING_FOLDERS
     assert calls[0][3] == "Dokumente"
+
+
+# ---- title signals in the prompts -------------------------------------------
+
+def test_folder_step_prompt_contains_title_and_correspondent_after_the_text():
+    """The folder decision must see the document's title/sender, not only
+    its raw text - and the (long, per-document constant) text must come
+    first so Ollama can reuse it across the steps of one walk."""
+    messages = classifier._build_folder_step_messages(
+        "OCR-VOLLTEXT", "scan.pdf", "Dokumente/Gesundheit", ["Krankenkasse"],
+        title="Mitgliedsbescheinigung", correspondent="Techniker Krankenkasse", pdf_title="Ihre Bescheinigung",
+    )
+    document, level = messages[1]["content"], messages[-1]["content"]
+    assert "OCR-VOLLTEXT" in document
+    assert "Titel des Dokuments: Mitgliedsbescheinigung" in document
+    assert "Absender des Dokuments: Techniker Krankenkasse" in document
+    assert "Titel laut PDF-Metadaten: Ihre Bescheinigung" in document
+    # the per-step part is a separate, final turn - nothing of it may leak
+    # into the constant document turn, or the prefix cache is lost
+    assert "Aktuelle Ebene: Dokumente/Gesundheit" in level and "- Krankenkasse" in level
+    assert "Aktuelle Ebene" not in document
+    assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
+
+
+def test_folder_step_prompt_without_text_says_so():
+    messages = classifier._build_folder_step_messages(
+        "", "motorrad anhaenger.jpg", "Dokumente", ["Motorrad"], title="motorrad anhaenger"
+    )
+    assert "(kein Text erkannt)" in messages[1]["content"]
+
+
+def test_walk_passes_title_and_correspondent_to_every_step(monkeypatch):
+    seen = []
+
+    def fake_decide(ocr_text, original_filename, current_path, children, ollama_host, model, timeout=120.0, **kwargs):
+        seen.append(kwargs)
+        return _decision("stay")
+
+    monkeypatch.setattr(classifier, "_decide_folder_step", fake_decide)
+
+    classifier._walk_folder_tree(
+        "text", "scan.pdf", EXISTING_FOLDERS, "Dokumente", "http://fake", "model",
+        correspondent="Werkstatt Beispiel", title="Inspektionsrechnung", pdf_title=None,
+    )
+
+    assert seen == [{"title": "Inspektionsrechnung", "correspondent": "Werkstatt Beispiel", "pdf_title": None}]
+
+
+def test_classify_with_given_content_skips_extraction(monkeypatch):
+    """OCR found nothing but the filename is descriptive: the caller passes
+    a content built from the filename, and no extraction call is made."""
+    def _must_not_run(*a, **k):
+        raise AssertionError("extract_content must not be called when content is given")
+
+    monkeypatch.setattr(classifier, "extract_content", _must_not_run)
+    walk_kwargs = []
+
+    def fake_walk(*a, **k):
+        walk_kwargs.append(k)
+        return ("Dokumente/Motorrad", False, 0.9, [])
+
+    monkeypatch.setattr(classifier, "_walk_folder_tree", fake_walk)
+
+    outcome, _ = classifier.classify(
+        ocr_text="", original_filename="motorrad anhaenger.jpg", existing_folders=EXISTING_FOLDERS,
+        ollama_host="http://fake", model="model",
+        content=ContentExtraction(title="motorrad anhaenger", correspondent="", confidence=0.7),
+    )
+
+    assert outcome.folder == "Dokumente/Motorrad"
+    assert outcome.title == "motorrad anhaenger"
+    assert outcome.confidence == 0.7
+    assert walk_kwargs[0]["title"] == "motorrad anhaenger"
+
+
+def test_ollama_calls_pin_context_and_keep_the_model_loaded(monkeypatch):
+    seen = {}
+
+    class RecordingClient:
+        def chat(self, **kwargs):
+            seen.update(kwargs)
+            return {"message": {"content": json.dumps({"title": "T", "correspondent": "", "confidence": 0.9})}}
+
+    monkeypatch.setattr(ollama, "Client", lambda *a, **k: RecordingClient())
+
+    classifier.extract_content("ocr text", "scan.pdf", "http://fake", "model")
+
+    assert seen["keep_alive"] == classifier.OLLAMA_KEEP_ALIVE
+    assert seen["options"]["num_ctx"] == 8192
+    assert "keywords" in seen["format"]["required"]
+
+
+def test_preload_never_raises(monkeypatch):
+    def unreachable(*a, **k):
+        raise ConnectionError("no ollama here")
+
+    monkeypatch.setattr(ollama, "Client", unreachable)
+
+    classifier.preload_model("http://fake", "model")  # must not raise
+
+
+def test_cloud_call_gets_filename_pdf_title_and_keywords_but_no_document_text(monkeypatch):
+    fake_client = _FakeAnthropicClient(
+        parsed_output=_decision_anthropic("existing", folder="Dokumente/Gesundheit")
+    )
+    monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: fake_client)
+    monkeypatch.setattr(
+        classifier, "extract_content",
+        lambda *a, **k: ContentExtraction(
+            title="Beendigung Zusatztarif", correspondent="", confidence=0.8,
+            keywords=["Krankenversicherung", "Kuendigung"],
+        ),
+    )
+
+    classifier.classify_via_anthropic(
+        ocr_text="GEHEIMER VOLLTEXT",
+        original_filename="Wir muessen leider die Teilnahme beenden.pdf",
+        existing_folders=EXISTING_FOLDERS,
+        ollama_host="http://fake",
+        model="model",
+        anthropic_api_key="sk-ant-fake",
+        anthropic_model="claude-haiku-4-5",
+        filename_title="Wir muessen leider die Teilnahme beenden",
+        pdf_title="Ende der Teilnahme",
+    )
+
+    sent = fake_client.messages.last_kwargs["messages"][0]["content"]
+    assert "Dateiname des Scans: Wir muessen leider die Teilnahme beenden" in sent
+    assert "PDF-Titel: Ende der Teilnahme" in sent
+    assert "Stichworte: Krankenversicherung, Kuendigung" in sent
+    assert "GEHEIMER VOLLTEXT" not in sent

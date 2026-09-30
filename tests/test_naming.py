@@ -101,3 +101,9 @@ def test_closest_existing_leaf_finds_best_match():
 
 def test_closest_existing_leaf_empty_list():
     assert naming.closest_existing_leaf("Neu/Ordner", []) is None
+
+
+def test_duplicate_filename_marks_the_first_copys_name():
+    assert naming.duplicate_filename("2026-09-29 ROLAND - Antrag.pdf", ".pdf") == "2026-09-29 ROLAND - Antrag (Duplikat).pdf"
+    # the duplicate is stored as the raw scan, so it keeps its own extension
+    assert naming.duplicate_filename("2026-09-29 Foto.pdf", "jpg") == "2026-09-29 Foto (Duplikat).jpg"

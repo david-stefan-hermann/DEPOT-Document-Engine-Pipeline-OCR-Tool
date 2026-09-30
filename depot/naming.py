@@ -74,6 +74,14 @@ def build_filename(
     return f"{date_str} {name_core}.{ext}"
 
 
+def duplicate_filename(original_filed_name: str, ext: str) -> str:
+    """Name for a scan whose exact content was already filed before: the
+    name the first copy was filed under, visibly marked, with the extension
+    of the file actually being stored now."""
+    stem = original_filed_name.rpartition(".")[0] or original_filed_name
+    return f"{stem} (Duplikat).{ext.lstrip('.')}"
+
+
 def resolve_collision(desired_name: str, existing_names: set[str]) -> str:
     """Append ' (2)', ' (3)', ... if desired_name already exists in the
     target folder."""

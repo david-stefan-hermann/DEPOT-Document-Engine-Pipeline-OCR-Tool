@@ -94,6 +94,15 @@ class FakeNextcloud:
         return httpx.Response(400)
 
 
+@pytest.fixture(autouse=True)
+def _no_model_preload(monkeypatch):
+    """The pipeline warms up the Ollama model in a background thread for
+    every document; tests have no Ollama server to warm up."""
+    from depot import classifier
+
+    monkeypatch.setattr(classifier, "preload_model", lambda *a, **k: None)
+
+
 @pytest.fixture
 def fake_server():
     return FakeNextcloud()

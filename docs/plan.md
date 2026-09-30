@@ -42,7 +42,8 @@ Fehlzuordnungen manuell in Nextcloud zu korrigieren.
   Klassifikationsentscheidung.
 - **Trigger:** vollautomatisch per Datei-Watcher auf `Scan Eingang`.
 - **Umgebung:** Docker-Container auf dem TrueNAS-Server selbst, neben Nextcloud.
-- **Ordnerstruktur-Abfrage:** live per WebDAV bei jedem Lauf (kein Cache).
+- **Ordnerstruktur-Abfrage:** live bei jedem Lauf, kurz gecacht — vom lokalen Mount, wenn er
+  den Baum abdeckt, sonst per WebDAV (siehe Datenfluss).
 - **Kein Review-Bereich:** direkte Einsortierung + Logdatei pro verarbeiteter Datei
   `DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt` in `Scan Eingang/Depot Config/` (siehe
   `CONFIG_SUBFOLDER`). Der Watcher ist nicht-rekursiv, sieht diesen Unterordner also
@@ -68,8 +69,10 @@ Fehlzuordnungen manuell in Nextcloud zu korrigieren.
 - **Cloud-Fallback für die Ordner-Entscheidung optional (`use_anthropic_classifier` in
   `DEPOT Config.json`, Default aus):** delegiert NUR die Ordner-Wahl an Anthropic (Claude),
   Titel/Datum/Absender-Extraktion bleibt immer lokal über Ollama. An Anthropic gehen
-  ausschließlich `correspondent` + `title` + die vollständige Ordnerpfad-Liste — NIEMALS
-  der OCR-Text oder Dateiname. Grund: die lokalen ~7-9B-Modelle scheitern nachweislich
+  `correspondent` + `title` + die vollständige Ordnerpfad-Liste, seit 2026-09-30 (bewusste
+  Nutzerentscheidung) zusätzlich — soweit vorhanden — der vom Nutzer vergebene Dateiname
+  (keine Scanner-Namen), der PDF-Metadaten-Titel und 3–6 lokal erzeugte allgemeine
+  Stichworte (ohne Ziffern/Namen, im Code gefiltert). NIEMALS der OCR-Text. Grund: die lokalen ~7-9B-Modelle scheitern nachweislich
   genau dort, wo für eine sinnvolle Kategorie-Entscheidung Weltwissen/Urteilsvermögen ohne
   Einblick in Ordnerinhalte nötig ist (siehe Architektur-Diagramm unten,
   `CORRESPONDENT_FOLDER_MATCH_THRESHOLD`-Grenze). Ist `ANTHROPIC_API_KEY` nicht gesetzt
@@ -94,14 +97,29 @@ watcher.py (watchdog Observer, on_created/on_moved + Startup-Sweep bei Container
    ▼
 pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │
-   ├─► ocr.py: Bilder → img2pdf → ocrmypdf --language deu --deskew --clean
-   │           --rotate-pages --sidecar text.txt  (ein einheitlicher Codepfad für
-   │           PDF und Bild). Qualitätscheck: bei zu wenig erkanntem Text Retry mit
-   │           --force-ocr, danach ggf. OCR_FAILED → Fallback mit Konfidenz 0.
+   ├─► Duplikat-Check: SHA-256 des Scans gegen die sqlite-DB; liegt derselbe Inhalt
+   │           noch am damaligen Ablageort → kein OCR/LLM, Ablage in Unsortiert als
+   │           "<Name der Erstablage> (Duplikat).ext", Tag [DUPLIKAT]
    │
-   ├─► webdav.py: PROPFIND auf Dokumente/ (Depth:1 rekursiv, da Nextcloud kein
-   │           Depth:infinity erlaubt) → flache Liste aller Unterordner, 5 Min. gecacht
-   │           (self-erstellte Ordner sofort im Cache ergänzt), gefiltert um
+   ├─► signals.py (ohne LLM): Dateiname → Nutzertitel + Datum oder Scanner-Name
+   │           (nur Scan-Zeitpunkt); PDF-Metadaten → Titel, Erstelldatum; alle
+   │           Datumsangaben im Text als Prüfmenge fürs Ausstellungsdatum
+   │
+   ├─► ocr.py: PDF mit vollständiger eigener Textebene (digital erzeugt) → KEIN OCR,
+   │           Text per pymupdf, Original wird unverändert abgelegt. Sonst:
+   │           Bilder → img2pdf → ocrmypdf --language deu --deskew --clean
+   │           --rotate-pages --skip-text --sidecar. Hatte das PDF teilweise Text,
+   │           wird der Text aus dem Ergebnis-PDF gelesen (die Sidecar-Datei enthält
+   │           für übersprungene Seiten nur einen Platzhalter). Retry mit --force-ocr
+   │           nur noch, wenn eine vorhandene Textebene offensichtlich Müll ist.
+   │           Kein verwertbarer Text → OCR_FAILED, das ORIGINAL (z.B. das Foto) wird
+   │           abgelegt; mit sprechendem Dateinamen trotzdem Klassifikation über den
+   │           Namen ([NUR-DATEINAME]), sonst Fallback mit Konfidenz 0.
+   │
+   ├─► Ordnerliste: per os.walk vom lokalen read-only-Mount, wenn er den Baum abdeckt
+   │           (15 s gecacht), sonst wie bisher per webdav.py: PROPFIND auf Dokumente/
+   │           (Depth:1 rekursiv, da Nextcloud kein Depth:infinity erlaubt), 5 Min.
+   │           gecacht (self-erstellte Ordner sofort im Cache ergänzt). Gefiltert um
    │           `excluded_folders` aus DEPOT Config.json UND strukturell IMMER um
    │           `SCAN_EINGANG_WEBDAV_PATH` (sonst könnte der Klassifikator ein Dokument
    │           in/unter den Scan-Eingang zurück-einsortieren, Endlosschleife mit dem
@@ -167,6 +185,23 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    │        Variation bei einer Aufgabe, bei der dasselbe Dokument immer gleich
    │        einsortiert werden soll.
    │
+   │        **Titel-Signale + Prompt-Aufbau (2026-09-30):** jeder Ordner-Schritt sieht
+   │        zusätzlich den extrahierten Absender/Titel, den Dateinamen und den
+   │        PDF-Titel. Der Dokumenttext steht als eigener erster Gesprächs-Turn VOR
+   │        der (pro Schritt wechselnden) Ebene, damit Ollama das ausgewertete Präfix
+   │        wiederverwendet. Wichtig: Text und Ebene in EINER Nachricht ("Text zuerst")
+   │        ließ das Modell bei 3 von 4 echten Dokumenten auf der Wurzelebene "stay"
+   │        antworten — erst die Zwei-Turn-Form entschied wieder wie das alte Prompt.
+   │        Prompt-Änderungen hier nur noch mit `tools/eval.py` gegenprüfen.
+   │        Beide Aufrufe: `num_ctx=8192` fest, `keep_alive=30m`, Modell wird beim
+   │        Start jeder Verarbeitung parallel zum OCR vorgeladen.
+   │
+   ├─► signals.resolve_issue_date(): Modell-Datum zählt nur, wenn es im Dokument
+   │           wirklich vorkommt und nicht in der Zukunft (bzw. nach dem
+   │           Scan-Zeitstempel) liegt; sonst Datum aus dem Dateinamen
+   │           ([DATUM-AUS-DATEINAME]), sonst — nur bei digital erzeugten PDFs — das
+   │           PDF-Erstelldatum ([DATUM-AUS-PDF-METADATEN]), sonst [DATUM-UNSICHER]
+   │
    ├─► naming.py: Titel sanitizen, Datum validieren, Dateiname
    │           "YYYY-MM-DD [Absender - ]Titel.ext" bauen, Kollisionen auflösen
    │           ("(2)", "(3)", …)
@@ -185,9 +220,14 @@ pipeline.py (Worker-Loop, Concurrency konfigurierbar, Default 1)
    └─► depotlog.py: eigene Logdatei pro Verarbeitungs-Event unter
                Scan Eingang/Depot Config/DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt
                schreiben, inkl. Sondermarkierung für [OCR-FEHLGESCHLAGEN],
-               [UNSORTIERT], [NEUER-ORDNER], [PROCESSED-KOPIE] und
-               [EINSORTIERUNG-DEAKTIVIERT]-Fälle
+               [UNSORTIERT], [NEUER-ORDNER], [PROCESSED-KOPIE],
+               [EINSORTIERUNG-DEAKTIVIERT], [NUR-DATEINAME], [DUPLIKAT] und die
+               Datumsquelle; jede Zeile enthält die Dauer der Stufen
+               (`ocr=…s llm=…s dav=…s`)
 ```
+
+Die laufende Überarbeitung (Befunde aus dem Produktivbetrieb, Phasen, Messwerte) steht in
+[ueberarbeitungsplan.md](ueberarbeitungsplan.md).
 
 ## Tech-Stack
 
@@ -280,17 +320,21 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
     config.py       # Env-Loading, dataclass
     watcher.py       # watchdog + Startup-Sweep + Debounce + Queue
     pipeline.py      # Verarbeitung pro Datei
-    ocr.py           # img2pdf/ocrmypdf-Wrapper, Qualitätscheck
+    ocr.py           # Textebenen-Check, img2pdf/ocrmypdf-Wrapper, Qualitätscheck
+    signals.py       # Dateiname/PDF-Metadaten/Datumsangaben auswerten (ohne LLM)
+    folder_index.py  # Ordnerbaum vom lokalen Mount lesen
     webdav.py        # PROPFIND / MKCOL / PUT / GET / DELETE / MOVE, httpx-basiert
     classifier.py    # Content-Extraktion + hierarchischer Ordner-Abstieg, Ollama-Aufrufe
     naming.py        # Sanitizing, Datumsparsing, Kollisionen, Fuzzy-Ordner-Match
     depotlog.py      # Dateilog-TXT-Writer, ein File pro Verarbeitungs-Event
     scan_config.py   # DEPOT Config.json (excluded_folders) lesen/anwenden
-    state.py         # sqlite Fehlversuch-Tracker
+    state.py         # sqlite: Fehlversuche + Hashes bereits abgelegter Scans
     models.py        # pydantic-Schemas (ContentExtraction, FolderStepDecision)
   tests/
     conftest.py       # Fake-Nextcloud-WebDAV-Server für Tests
     test_*.py
+  tools/
+    eval.py           # Klassifikations-Eval gegen einen handsortierten Baum (nicht im Image)
   infra/
     ollama/
       docker-compose.yml  # Ollama-Stack für Dockge auf dem TrueNAS-Server
@@ -351,7 +395,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (133 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (195 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur
