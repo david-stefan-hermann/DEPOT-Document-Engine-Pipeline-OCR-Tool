@@ -15,6 +15,7 @@ import httpx
 from depot import classifier, depotlog, folder_index, naming, ocr, scan_config, signals
 from depot.config import Config
 from depot.depotlog import DepotLog
+from depot.embeddings import Embedder
 from depot.models import ContentExtraction, OcrResult
 from depot.ocr_cache import OcrCache
 from depot.state import StateStore
@@ -102,9 +103,14 @@ class Pipeline:
             self.webdav, config.scan_eingang_webdav_path, config.log_file_prefix, config.config_subfolder
         )
         self.state = state or StateStore(config.state_db_path)
-        cache_dir = config.ocr_cache_dir or str(Path(config.state_db_path).parent / "ocr-cache")
-        self.ocr_cache = OcrCache(cache_dir)
+        scratch = Path(config.state_db_path).parent
+        self.ocr_cache = OcrCache(config.ocr_cache_dir or str(scratch / "ocr-cache"))
         self.ocr_cache.prune()
+        self.embedder: Embedder | None = (
+            Embedder(config.ollama_host, config.embedding_model, scratch / "embeddings.sqlite3")
+            if config.embedding_model
+            else None
+        )
         self._transient_retries: dict[str, int] = {}
         self._transient_lock = threading.Lock()
         self._folder_cache: list[str] | None = None
@@ -195,6 +201,13 @@ class Pipeline:
     def close(self) -> None:
         self.webdav.close()
         self.state.close()
+        if self.embedder is not None:
+            self.embedder.close()
+
+    def _preload_models(self) -> None:
+        classifier.preload_model(self.config.ollama_host, self.config.ollama_model)
+        if self.embedder is not None:
+            self.embedder.preload()
 
     # ---- workers -----------------------------------------------------------
 
@@ -492,11 +505,8 @@ class Pipeline:
         if ocr_result is not None:
             log.info("Reusing the OCR result of an earlier attempt for %s", original_name)
         else:
-            # Let a cold model load while OCR runs instead of after it.
-            threading.Thread(
-                target=classifier.preload_model, args=(cfg.ollama_host, cfg.ollama_model),
-                daemon=True, name="depot-preload",
-            ).start()
+            # Let cold models load while OCR runs instead of after it.
+            threading.Thread(target=self._preload_models, daemon=True, name="depot-preload").start()
             ocr_result = self.ocr_cache.put(content_hash, ocr.process_file(path, cfg.ocr_language), path)
         ocr_seconds = time.perf_counter() - started
 
@@ -587,7 +597,7 @@ class Pipeline:
                     anthropic_model=cfg.anthropic_model,
                 )
             else:
-                result, classifier_tags = classifier.classify(**classify_args)
+                result, classifier_tags = classifier.classify(**classify_args, embedder=self.embedder)
             tags += classifier_tags
             confidence = result.confidence
             title = result.title

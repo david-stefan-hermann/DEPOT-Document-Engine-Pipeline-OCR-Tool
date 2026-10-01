@@ -132,6 +132,8 @@ class Candidate:
     examples: list[str] = field(default_factory=list)
     # How many files directly in that folder carry the document's sender.
     sender_files: int = 0
+    # Position by words alone (1 = best), whatever the final order is.
+    lexical_rank: int = 0
 
 
 class _Folder:
@@ -179,24 +181,13 @@ def _subfolders_with_more_evidence_first(
     return ordered
 
 
-def rank_candidates(
-    query: DocumentQuery,
-    folders: list[str],
-    folder_files: dict[str, list[str]] | None = None,
-    limit: int = DEFAULT_LIMIT,
-) -> list[Candidate]:
-    """The `limit` folders that have the most in common with the document,
-    best first. Empty if nothing matches at all.
-
-    Subfolders that are just a year ("2024") never appear on their own:
-    their files count for the folder above, and which year a document goes
-    into follows from its date, not from a choice."""
-    if not folders:
-        return []
+def collapsed_folders(folders: list[str], folder_files: dict[str, list[str]] | None) -> dict[str, list[str]]:
+    """The folders a document can be shortlisted for, each with the names
+    of its files: year subfolders ("2024") are folded into their parent and
+    saved-web-page asset folders are dropped. Exactly the paths that
+    rank_candidates scores - and therefore the ones to embed."""
     folder_files = folder_files or {}
     known = set(folders)
-    root = min(folders, key=len).split("/")[0]
-
     files_of: dict[str, list[str]] = {}
     for path in folders:
         if any(_SAVED_PAGE_ASSETS.search(segment) for segment in path.split("/")):
@@ -204,6 +195,109 @@ def rank_candidates(
         parent, _, leaf = path.rpartition("/")
         target = parent if _YEAR.fullmatch(leaf) and parent in known else path
         files_of.setdefault(target, []).extend(folder_files.get(path, []))
+    return files_of
+
+
+# --- texts for the embedding model ------------------------------------------
+
+_FILE_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}\s*")
+_FILE_SUFFIX = re.compile(r"\s*\((\d+|Duplikat|Datum unsicher)\)\s*$")
+FOLDER_TEXT_FILES = 12
+DOCUMENT_TEXT_EXCERPT = 400
+
+
+def _file_title(name: str) -> str:
+    stem = name.rsplit(".", 1)[0] if "." in name else name
+    return _FILE_SUFFIX.sub("", _FILE_DATE.sub("", stem)).strip()
+
+
+def folder_text(path: str, root: str, filenames: list[str], max_files: int = FOLDER_TEXT_FILES) -> str:
+    """What a folder is about, for the embedding model: its path (without
+    year folders) and the titles of the files already in it."""
+    segments = [s for s in path[len(root) + 1:].split("/") if s and not _YEAR.fullmatch(s)]
+    titles: list[str] = []
+    for name in filenames:
+        title = _file_title(name)
+        if title and title not in titles:
+            titles.append(title)
+    lines = ["Ordner: " + " > ".join(segments)]
+    if titles:
+        lines.append("Dateien: " + "; ".join(titles[:max_files]))
+    return "\n".join(lines)
+
+
+def document_text(query: DocumentQuery) -> str:
+    """What the document is about, for the embedding model. Measured: the
+    short excerpt of the text raises the share of documents whose folder
+    comes first from 33 % to 39 % (120 documents)."""
+    lines = [f"Absender: {query.correspondent}", f"Titel: {query.title}"]
+    if query.filename_title:
+        lines.append(f"Dateiname: {query.filename_title}")
+    if query.keywords:
+        lines.append("Stichworte: " + ", ".join(query.keywords))
+    excerpt = " ".join(query.text.split())[:DOCUMENT_TEXT_EXCERPT]
+    if excerpt:
+        lines.append("Auszug: " + excerpt)
+    return "\n".join(lines)
+
+
+# Share of the lexical score and of the semantic similarity in the fused
+# ranking. Measured on 120 documents (see docs/ueberarbeitungsplan.md 5d).
+_FUSE_LEXICAL = 0.5
+_FUSE_SEMANTIC = 0.5
+# The similarity is scaled between the best folder and the 30th best: below
+# that everything is equally unrelated.
+_SEMANTIC_FLOOR_RANK = 30
+
+
+def _fused_order(
+    index: dict[str, _Folder], lexical: dict[str, float], semantic: dict[str, float], strong_score: float
+) -> list[tuple[float, _Folder]]:
+    """Blend of lexical score (relative to the best lexical match) and
+    semantic similarity (scaled between the best and the 30th best folder).
+    Folders with strong word evidence (score >= `strong_score`, i.e. the
+    sender's name or several of its documents) stay ahead of everything
+    else: exact names are what the embedding model blurs."""
+    max_lexical = max(lexical.values(), default=0.0) or 1.0
+    sims = sorted((semantic.get(path, 0.0) for path in index), reverse=True)
+    high = sims[0] if sims else 0.0
+    low = sims[min(len(sims) - 1, _SEMANTIC_FLOOR_RANK)] if sims else 0.0
+    span = (high - low) or 1.0
+    fused = []
+    for path, folder in index.items():
+        relatedness = max(0.0, (semantic.get(path, low) - low) / span)
+        score = lexical.get(path, 0.0)
+        value = _FUSE_LEXICAL * score / max_lexical + _FUSE_SEMANTIC * relatedness
+        if score >= strong_score:
+            value += 1.0
+        if value > 0:
+            fused.append((value, folder))
+    return fused
+
+
+def rank_candidates(
+    query: DocumentQuery,
+    folders: list[str],
+    folder_files: dict[str, list[str]] | None = None,
+    limit: int = DEFAULT_LIMIT,
+    semantic: dict[str, float] | None = None,
+) -> list[Candidate]:
+    """The `limit` folders that have the most in common with the document,
+    best first. Empty if nothing matches at all.
+
+    Subfolders that are just a year ("2024") never appear on their own:
+    their files count for the folder above, and which year a document goes
+    into follows from its date, not from a choice.
+
+    `semantic` (folder path -> cosine similarity of an embedding model, for
+    the paths of collapsed_folders) is blended into the ORDER only: score,
+    strength and sender_files stay lexical, so what counts as evidence for
+    the filing decision is unchanged. A folder no word matches can still
+    make the list this way."""
+    if not folders:
+        return []
+    root = min(folders, key=len).split("/")[0]
+    files_of = collapsed_folders(folders, folder_files)
 
     index = {path: _Folder(path, root, filenames) for path, filenames in files_of.items()}
     for path, folder in index.items():
@@ -256,6 +350,7 @@ def rank_candidates(
     sender_total = sum(idf(t) for t in sender_tokens)
 
     scored: list[tuple[float, _Folder]] = []
+    lexical: dict[str, float] = {}
     # How well the files in a folder match WHAT the document is (title,
     # keywords) - the sender is left out: below a folder named after the
     # sender, every subfolder shares that match, and a lone spreadsheet
@@ -287,14 +382,22 @@ def rank_candidates(
             score += _WEIGHT_TEXT * idf(token) * (
                 _FIELD_LEAF * (token in folder.leaf_tokens) + _FIELD_ANCESTOR * (token in folder.ancestor_tokens)
             )
+        lexical[folder.path] = score
         if score > 0:
             scored.append((score, folder))
 
     scored.sort(key=lambda item: (-item[0], item[1].path))
     scored = _subfolders_with_more_evidence_first(scored[:_REORDER_WINDOW], file_evidence)
+    lexical_rank = {folder.path: n for n, (_, folder) in enumerate(scored, 1)}
+    if semantic:
+        scored = _fused_order(index, lexical, semantic, strong_score=STRONG_EVIDENCE * math.log(1.0 + total))
+        # ties go to the folder with word evidence
+        scored.sort(key=lambda item: (-item[0], -lexical[item[1].path], item[1].path))
+        scored = _subfolders_with_more_evidence_first(scored[:_REORDER_WINDOW], file_evidence)
     query_tokens = set(weights)
     result = []
-    for score, folder in scored[:limit]:
+    for _, folder in scored[:limit]:
+        score = lexical[folder.path]
         ranked_files = sorted(folder.files, key=lambda f: (-sum(weights[t] for t in f[1] & query_tokens), f[0]))
         examples = [name for name, _ in ranked_files[:EXAMPLES_PER_CANDIDATE]]
         if not examples and folder.children:
@@ -307,6 +410,6 @@ def rank_candidates(
             )
         result.append(Candidate(
             path=folder.path, score=score, strength=score / math.log(1.0 + total),
-            examples=examples, sender_files=sender_files,
+            examples=examples, sender_files=sender_files, lexical_rank=lexical_rank.get(folder.path, 0),
         ))
     return result

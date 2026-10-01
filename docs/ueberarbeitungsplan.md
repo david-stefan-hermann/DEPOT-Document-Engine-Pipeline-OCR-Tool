@@ -1,8 +1,8 @@
 # DEPOT — Überarbeitungsplan: bessere Zuordnung, schnellere Verarbeitung
 
-Stand: 2026-10-01. Status: **Phase 0–3 umgesetzt, Phase 4 offen** — Ergebnisse und
-Messwerte in den Abschnitten 5a (Phase 1), 5b (Phase 2) und 5c (Phase 3; die OCR-Messung
-3.3 steht noch aus, das Werkzeug dafür liegt bereit). Ergänzt [plan.md](plan.md)
+Stand: 2026-10-02. Status: **Phase 0–4 umgesetzt** — Ergebnisse und Messwerte in den
+Abschnitten 5a (Phase 1), 5b (Phase 2), 5c (Phase 3) und 5d (Phase 4). Auf dem Server
+bestätigt ist davon noch nichts. Ergänzt [plan.md](plan.md)
 (Architektur-Ist-Stand) um eine priorisierte Überarbeitung. Grundlage sind nicht Vermutungen,
 sondern (a) der komplette Code, (b) die 31 echten Dateilog-Einträge aus dem Produktivbetrieb,
 (c) die tatsächlich abgelegten PDFs und (d) Live-Messungen gegen den echten Ollama-Server
@@ -372,12 +372,30 @@ Umsetzung der Planpunkte und Abweichungen (Details zum Ablauf in [plan.md](plan.
 - **3.3 OCR-Optionen nach Messung** — Werkzeug fertig (`tools/ocr_bench.py`: Varianten
   ohne `--clean`, ohne `--deskew`, ohne `--rotate-pages`, `--optimize 0`, `deu+eng`,
   `--jobs 1/4`; je Zeit, Größe, Wortzahl und Textübereinstimmung mit dem heutigen Stand),
-  **Messung offen**: Tesseract gibt es nur im Container, und Docker Desktop auf dem
-  Entwicklungsrechner startet derzeit nicht. Die Optionen sind deshalb unverändert. Lauf
-  auf dem Server: `docker compose exec depot python tools/ocr_bench.py
-  /nextcloud-data/Dokumente/<Beispielscans...> --out /scratch/ocr-bench.json`.
-  Entscheidungsregel danach: eine Option bleibt nur, wenn sie Text bringt, den die
-  Variante ohne sie nicht liefert — nicht, weil sie "sauberer" klingt.
+  gemessen am 2026-10-02 im DEPOT-Image auf dem Entwicklungsrechner (16 Kerne) mit 8
+  echten Dateien (7 Scanner-PDFs mit zusammen 13 Seiten, 1 Foto ohne Text), jeweils mit
+  `--force-ocr`. Entscheidungsregel: eine Option bleibt nur, wenn sie Text bringt, den die
+  Variante ohne sie nicht liefert.
+
+  | Variante | Zeit gesamt | relativ | erkannte Wörter | Text gleich wie bisher |
+  |---|---|---|---|---|
+  | bisher (`--deskew --clean --rotate-pages`) | 122 s | 1,00 | 2468 | — |
+  | ohne `--clean` | 82 s | 0,67 | 2468 | 6 von 7 identisch, 1× 97 % |
+  | ohne `--deskew` | 76 s | 0,62 | 2495 | 90–100 % |
+  | ohne `--rotate-pages` | 114 s | 0,93 | 2468 | identisch |
+  | nur OCR | 52 s | 0,43 | 2495 | 90–100 % |
+  | `--optimize 0` | 110 s | 0,90 | 2468 | identisch |
+  | `deu+eng` | 123 s | 1,01 | 2473 | 91–100 % |
+  | `--jobs 1` / `--jobs 4` | 151 s / 123 s | 1,24 / 1,00 | 2468 | identisch |
+
+  Konsequenz: **`--clean` ist entfernt** (ein Drittel der OCR-Zeit ohne messbaren Nutzen).
+  `--deskew` bleibt trotz ähnlicher Kosten: die Testscans kamen alle gerade aus dem
+  Scanner, sein Nutzen liegt bei schief fotografierten Seiten, die im Testsatz fehlen —
+  "Text anders" heißt hier nicht "Text schlechter", dafür fehlt eine Referenz.
+  `--rotate-pages` bleibt (7 %, schützt vor kopfstehenden Seiten). `--jobs` und
+  `--optimize` bleiben beim Standard. `deu+eng` kostet nichts, ändert aber den Text
+  deutscher Dokumente um einige Prozent; über `OCR_LANGUAGE=deu+eng` einstellbar, nicht
+  Standard. Wiederholbar mit `tools/ocr_bench.py` (auch im Container auf dem Server).
 - **3.4 Periodischer Sweep** — umgesetzt (`SWEEP_INTERVAL_SECONDS`, Default 600, 0 = aus).
   Nimmt nur Dateien, die seit 60 s unverändert sind und nicht gerade vom Watcher
   entprellt werden. Dazu eine Queue ohne Doppeleinträge (`workqueue.py`): Event, Sweep
@@ -405,6 +423,54 @@ Scanner-PDFs sinkt die Zeit pro Dokument von OCR + LLM auf die längere der beid
 bei digitalen PDFs (OCR ≈ 1 s) ändert sich nichts. Die echten Zahlen liefern die
 `ocr=`/`llm=`-Werte in den Dateilogs nach dem Deploy (die Zeitstempel-Abstände zwischen
 den Logs geben den Durchsatz, die Stufenwerte die Auslastung).
+
+### 5d. Stand nach Phase 4 (2026-10-02)
+
+**Embedding-Modell für die Vorauswahl** (`EMBEDDING_MODEL`, Standard: aus; Details in
+[plan.md](plan.md)). Das Modell läuft über denselben Ollama-Server, aber auf der CPU
+(`num_gpu: 0`): gemessen ~0,1 s pro Text, Kaltstart 2–3 s, kein VRAM-Konflikt mit dem
+Chat-Modell. Ein Text pro Ordner (Pfad + Titel der abgelegten Dateien), Vektoren in einem
+sqlite-Cache unter `/scratch`; pro Dokument fällt im Betrieb ein Embedding-Aufruf an.
+
+Gemessen auf denselben 120 Dokumenten wie in 5b:
+
+| Variante | exakt | eine Ebene daneben | `Unsortiert` | falsch einsortiert |
+|---|---|---|---|---|
+| nur Wörter (Stand 5b) | 60 | 4 | 41 | 15 |
+| Embedding nur in der Reihenfolge, `bge-m3` | 60 | 4 | 41 | 15 |
+| Embedding nur in der Reihenfolge, `qwen3-embedding:0.6b` | 60 | 4 | 43 | 13 |
+| **+ Übereinstimmung als Beleg, `bge-m3`** | **65** | 4 | **36** | 15 |
+| + Übereinstimmung als Beleg, `qwen3-embedding:0.6b` | 66 | 4 | 37 | 13 |
+
+Was die Messung gezeigt hat:
+
+- **Die Vorauswahl wird besser, das Endergebnis dadurch allein nicht.** Mit `bge-m3` steht
+  der richtige Ordner öfter vorn (Platz 1: 42 → 47, unter den ersten drei: 52 → 62 von
+  120), aber die Wahl des Modells und vor allem die Beleg-Regel ändern sich dadurch nicht:
+  was nicht belegt ist, geht weiter nach `Unsortiert`.
+- **Die Höhe der Ähnlichkeit taugt nicht als Beleg** (im häufigsten Wertebereich war der
+  ähnlichste Ordner nur in 69 % der Fälle der richtige).
+- **Die Übereinstimmung zweier unabhängiger Signale taugt:** wo Wort-Vergleich und
+  Embedding denselben Ordner an erste Stelle setzen, war er in 63 von 69 Fällen richtig
+  (ohne die 9 bewusst themenfremd abgelegten Gehaltsabrechnungen). Das ist jetzt ein
+  zweiter Weg zu "belegt": gewählter Ordner = bester nach Wörtern = bester fürs
+  Embedding → Konfidenz 0.8, Tag `WORT-UND-BEDEUTUNG-EINIG`. Im Test: 5 bzw. 6 Dokumente
+  mehr exakt einsortiert, keine zusätzliche Fehlablage.
+- Zwei verworfene Varianten: Embeddings der einzelnen Dateititel statt eines Textes pro
+  Ordner (schlechter als die Wort-Vorauswahl) und ein Instruktions-Präfix für die Anfrage
+  (kein Gewinn).
+
+Einordnung: der Gewinn ist echt, aber klein (5–6 von 120), und die Stichprobe für die neue
+Regel ist entsprechend dünn. Deshalb bleibt `EMBEDDING_MODEL` standardmäßig leer; empfohlen
+ist `qwen3-embedding:0.6b` (`ollama pull qwen3-embedding:0.6b`, 0,6 GB): im Test das
+beste Ergebnis und zwei Fehlablagen weniger; `bge-m3` (1,2 GB) liegt knapp dahinter. Die bekannte Grenze aus 5b
+("Curriculum Vitae" ↔ `Lebenslauf`) löst es nur halb: der Ordner kommt jetzt in die
+Vorauswahl und wird vorgeschlagen, einsortiert wird aber weiterhin nur mit Beleg.
+
+**Modellwechsel** (zweiter Punkt von Phase 4): nicht erneut gemessen. Mit
+`tools/eval.py --model <name>` ist der Vergleich jetzt ein einzelner Lauf (~40 min mit
+neuer Extraktion); der frühere Einzelfall-Vergleich mit `gemma2:9b` sprach nicht für einen
+Wechsel.
 
 ### Phase 3 — Durchsatz und Robustheit
 

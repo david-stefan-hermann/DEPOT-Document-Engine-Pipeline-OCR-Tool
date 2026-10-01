@@ -60,6 +60,9 @@ class Config:
     # Where OCR results wait until their scan is filed (survives restarts).
     # None: next to the state DB.
     ocr_cache_dir: str | None = None
+    # Ollama embedding model for the semantic half of the folder shortlist
+    # (see depot/embeddings.py). Empty: shortlist by words only.
+    embedding_model: str = ""
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -113,4 +116,5 @@ class Config:
             not in ("0", "false", "no", "off"),
             sweep_interval_seconds=float(os.environ.get("SWEEP_INTERVAL_SECONDS", "600")),
             ocr_cache_dir=os.environ.get("OCR_CACHE_DIR") or None,
+            embedding_model=os.environ.get("EMBEDDING_MODEL", "").strip(),
         )

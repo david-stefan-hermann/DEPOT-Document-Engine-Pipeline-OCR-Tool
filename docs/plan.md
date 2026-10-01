@@ -124,7 +124,7 @@ pipeline.py — zwei Stufen, damit CPU und GPU gleichzeitig arbeiten:
    │
    ├─► ocr.py: PDF mit vollständiger eigener Textebene (digital erzeugt) → KEIN OCR,
    │           Text per pymupdf, Original wird unverändert abgelegt. Sonst:
-   │           Bilder → img2pdf → ocrmypdf --language deu --deskew --clean
+   │           Bilder → img2pdf → ocrmypdf --language deu --deskew (kein --clean mehr)
    │           --rotate-pages --skip-text --sidecar. Hatte das PDF teilweise Text,
    │           wird der Text aus dem Ergebnis-PDF gelesen (die Sidecar-Datei enthält
    │           für übersprungene Seiten nur einen Platzhalter). Retry mit --force-ocr
@@ -170,6 +170,15 @@ pipeline.py — zwei Stufen, damit CPU und GPU gleichzeitig arbeiten:
    │        Dokumente lagen; ein Schreiben eines Absenders ohne eigenen Ordner landete
    │        in einer beliebigen Kategorie). Weil die Vorauswahl bei jedem Lauf aus dem
    │        echten Baum entsteht, lernt sie aus jeder Korrektur von Hand.
+   │        Optional (`EMBEDDING_MODEL`, seit 2026-10-01): ein Embedding-Modell auf
+   │        demselben Ollama (auf der CPU, `num_gpu: 0` — die Karte ist mit dem
+   │        Chat-Modell voll) bewertet zusätzlich die BEDEUTUNG: ein Text pro Ordner
+   │        (Pfad + Titel der abgelegten Dateien, `candidates.folder_text`) gegen einen
+   │        Text fürs Dokument (Absender, Titel, Stichworte, 400 Zeichen Auszug).
+   │        Die Ähnlichkeit fließt nur in die REIHENFOLGE der Kandidaten ein
+   │        (`candidates.rank_candidates(semantic=…)`), Beleg-Stärke und
+   │        Absender-Dateien bleiben wörtlich; stark belegte Ordner bleiben vorn.
+   │        Vektoren werden unter /scratch gecacht (`embeddings.py`).
    │     3. _pick_folder(): EIN Ollama-Aufruf wählt unter den Kandidaten (je mit bis zu
    │        drei Beispieldateien) und den Hauptordnern. Er ist ein Folge-Turn des
    │        Extraktions-Gesprächs (gleiches Präfix → der Dokumenttext wird nicht erneut
@@ -187,7 +196,10 @@ pipeline.py — zwei Stufen, damit CPU und GPU gleichzeitig arbeiten:
    │     5. Konfidenz aus dem Beleg statt aus der Selbstauskunft des Modells (die bei
    │        richtigen wie falschen Antworten 0.9+ meldete): 0.9, wenn der gewählte
    │        Ordner stark belegt ist oder dort bereits Dateien dieses Absenders liegen;
-   │        0.7 für einen neuen Unterordner in einem solchen Ordner; 0.5 ohne Beleg.
+   │        0.8, wenn der gewählte Ordner sowohl nach Wörtern als auch für das
+   │        Embedding-Modell der beste ist ([WORT-UND-BEDEUTUNG-EINIG] — zwei
+   │        unabhängige Signale; gemessen in 63 von 69 Fällen richtig); 0.7 für
+   │        einen neuen Unterordner in einem belegten Ordner; 0.5 ohne Beleg.
    │        0.5 liegt unter dem Standard-`CONFIDENCE_THRESHOLD` (0.6): das Dokument geht
    │        nach Unsortiert, der Vorschlag steht in der Logzeile ("Vorschlag: …"). Wird
    │        es von Hand einsortiert, findet das nächste gleichartige Dokument es dort.
@@ -266,7 +278,9 @@ Die laufende Überarbeitung (Befunde aus dem Produktivbetrieb, Phasen, Messwerte
 - `httpx` + `xml.etree.ElementTree` — schlanker, selbstgeschriebener WebDAV-Client
   (PROPFIND/MKCOL/PUT/GET/DELETE/MOVE); bewusst keine vollwertige WebDAV-Library, passt
   zum Wunsch nach wenig Abhängigkeiten.
-- `ollama` (offizieller Python-Client) — Chat-Aufruf mit JSON-Schema-Format.
+- `ollama` (offizieller Python-Client) — Chat-Aufruf mit JSON-Schema-Format; optional
+  `embed()` mit einem Embedding-Modell (`EMBEDDING_MODEL`, z.B. `qwen3-embedding:0.6b`) für die
+  Ordner-Vorauswahl.
 - `anthropic` (offizieller Python-Client) — optionaler Cloud-Fallback für die
   Ordner-Entscheidung (`use_anthropic_classifier`), `messages.parse()` mit strukturierter
   Pydantic-Ausgabe. Nur diese eine Entscheidung, nie Titel/Datum-Extraktion und nie der
@@ -350,7 +364,9 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
     folder_index.py  # Ordnerbaum samt Dateinamen vom lokalen Mount lesen
     webdav.py        # PROPFIND / MKCOL / PUT / GET / DELETE / MOVE, httpx-basiert
     classifier.py    # Content-Extraktion + Ordner-Entscheidung, Ollama-/Anthropic-Aufrufe
-    candidates.py    # Ordner-Vorauswahl aus Ordner- und Dateinamen (ohne LLM)
+    candidates.py    # Ordner-Vorauswahl aus Ordner- und Dateinamen (ohne LLM), optional
+                     # mit Embedding-Ähnlichkeit in der Reihenfolge
+    embeddings.py    # Ollama-Embedding-Modell (CPU) mit sqlite-Vektor-Cache
     naming.py        # Sanitizing, Dateiname bauen, Kollisionen, Absender-Normalisierung
     depotlog.py      # Dateilog-TXT-Writer, ein File pro Verarbeitungs-Event
     scan_config.py   # DEPOT Config.json (excluded_folders) lesen/anwenden
@@ -426,7 +442,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (260 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (275 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

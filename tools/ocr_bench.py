@@ -42,15 +42,15 @@ from depot import ocr  # noqa: E402
 # name -> (extra ocrmypdf flags, language). The pipeline's own flags live in
 # ocr._run_ocrmypdf; "aktuell" mirrors them.
 VARIANTS: dict[str, tuple[list[str], str]] = {
-    "aktuell": (["--deskew", "--clean", "--rotate-pages"], "deu"),
-    "ohne-clean": (["--deskew", "--rotate-pages"], "deu"),
-    "ohne-deskew": (["--clean", "--rotate-pages"], "deu"),
-    "ohne-rotate": (["--deskew", "--clean"], "deu"),
+    "aktuell": (["--deskew", "--rotate-pages"], "deu"),
+    "mit-clean": (["--deskew", "--clean", "--rotate-pages"], "deu"),
+    "ohne-deskew": (["--rotate-pages"], "deu"),
+    "ohne-rotate": (["--deskew"], "deu"),
     "nur-ocr": ([], "deu"),
-    "optimize0": (["--deskew", "--clean", "--rotate-pages", "--optimize", "0"], "deu"),
-    "deu+eng": (["--deskew", "--clean", "--rotate-pages"], "deu+eng"),
-    "jobs1": (["--deskew", "--clean", "--rotate-pages", "--jobs", "1"], "deu"),
-    "jobs4": (["--deskew", "--clean", "--rotate-pages", "--jobs", "4"], "deu"),
+    "optimize0": (["--deskew", "--rotate-pages", "--optimize", "0"], "deu"),
+    "deu+eng": (["--deskew", "--rotate-pages"], "deu+eng"),
+    "jobs1": (["--deskew", "--rotate-pages", "--jobs", "1"], "deu"),
+    "jobs4": (["--deskew", "--rotate-pages", "--jobs", "4"], "deu"),
 }
 REFERENCE = "aktuell"
 
@@ -82,7 +82,9 @@ def word_overlap(a: str, b: str) -> float:
     in the other text - 1.0 means nothing the reference found is missing."""
     ref = {w.strip(".,;:()").casefold() for w in a.split() if len(w.strip(".,;:()")) >= 3}
     other = {w.strip(".,;:()").casefold() for w in b.split() if len(w.strip(".,;:()")) >= 3}
-    return round(len(ref & other) / len(ref), 3) if ref else 0.0
+    if not ref:
+        return 1.0 if not other else 0.0  # nothing to find (a photo): equal if both found nothing
+    return round(len(ref & other) / len(ref), 3)
 
 
 def main() -> None:

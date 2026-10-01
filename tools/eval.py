@@ -130,6 +130,8 @@ def main() -> None:
     parser.add_argument("--threshold", type=float, default=float(os.environ.get("CONFIDENCE_THRESHOLD", "0.6")))
     parser.add_argument("--ollama-host", default=os.environ.get("OLLAMA_HOST", "http://localhost:11434"))
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M"))
+    parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", ""),
+                        help="Ollama embedding model for the semantic half of the shortlist ('' = lexical only)")
     parser.add_argument("--depot-path", type=Path, default=Path(__file__).resolve().parent.parent,
                         help="checkout whose depot/ package is evaluated (for comparing two versions)")
     parser.add_argument("--label", default="", help="name for this run, used in the output filename")
@@ -142,6 +144,11 @@ def main() -> None:
         from depot import candidates as candidates_module  # noqa: E402
     except ImportError:
         candidates_module = None
+    embedder = None
+    if args.embedding_model:
+        from depot.embeddings import Embedder  # noqa: E402
+
+        embedder = Embedder(args.ollama_host, args.embedding_model, RESULTS_DIR / "embedding-cache.sqlite3")
 
     tree: Path = args.tree.resolve()
     root = tree.name
@@ -185,13 +192,14 @@ def main() -> None:
                 continue
 
             if candidates_module is not None:
-                ranked = candidates_module.rank_candidates(
-                    candidates_module.DocumentQuery(
-                        correspondent=content.correspondent, title=content.title,
-                        keywords=list(content.keywords), filename_title=name_signals.title or "", text=text,
-                    ),
-                    folders, loo_files, limit=10,
+                query = candidates_module.DocumentQuery(
+                    correspondent=content.correspondent, title=content.title,
+                    keywords=list(content.keywords), filename_title=name_signals.title or "", text=text,
                 )
+                semantic = None
+                if embedder is not None:
+                    semantic = classifier.semantic_similarities(embedder, query, folders, loo_files, root)
+                ranked = candidates_module.rank_candidates(query, folders, loo_files, limit=10, semantic=semantic)
                 paths = [c.path for c in ranked]
                 rank = paths.index(truth) + 1 if truth in paths else 0
                 ancestor_rank = next(
@@ -214,6 +222,8 @@ def main() -> None:
             if "resolve_date" in classify_params:
                 kwargs["resolve_date"] = lambda d: signals.resolve_issue_date(
                     d, text, name_signals, None, date.today())[0]
+            if embedder is not None and "embedder" in classify_params:
+                kwargs["embedder"] = embedder
             outcome, tags = classifier.classify(**kwargs)
             seconds = extract_seconds + time.perf_counter() - started
             verdict = _verdict(truth, outcome.folder, outcome.confidence >= args.threshold)

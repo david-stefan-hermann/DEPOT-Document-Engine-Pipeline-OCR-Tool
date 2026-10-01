@@ -84,11 +84,15 @@ def _is_born_digital(pages: list[tuple[str, bool]]) -> bool:
 
 
 def _run_ocrmypdf(src_pdf: Path, out_pdf: Path, sidecar: Path, language: str, force: bool) -> None:
+    # No --clean (unpaper): measured with tools/ocr_bench.py on 8 real scans
+    # it took a third of the OCR time and left the recognized text identical
+    # in 6 of 7 documents (97 % identical in the seventh). --deskew stays:
+    # it costs about as much, but it is what makes a crooked phone photo
+    # readable, and the test scans were all straight.
     cmd = [
         "ocrmypdf",
         "--language", language,
         "--deskew",
-        "--clean",
         "--rotate-pages",
         "--sidecar", str(sidecar),
         "--output-type", "pdf",

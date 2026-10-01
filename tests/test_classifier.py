@@ -917,3 +917,114 @@ def test_backed_folder_is_not_descended_any_further_by_the_model(monkeypatch):
     )
 
     assert outcome.folder == "Dokumente/Fahrzeuge/MT-07"
+
+
+# ---- semantic shortlist (embedding model) ------------------------------------
+
+from depot.candidates import DocumentQuery  # noqa: E402
+
+class _FakeEmbedder:
+    """Returns a fixed similarity for one folder text and a low one for the rest."""
+
+    model = "fake-embed"
+
+    def __init__(self, favourite: str | None = None, fail: bool = False):
+        self.favourite = favourite
+        self.fail = fail
+        self.texts: list[str] = []
+
+    def embed(self, texts):
+        if self.fail:
+            raise ConnectionError("embedding model unreachable")
+        self.texts = texts
+        vectors = []
+        for text in texts:
+            if text.startswith("Absender:") or (self.favourite and self.favourite in text):
+                vectors.append([1.0, 0.0])
+            else:
+                vectors.append([0.0, 1.0])
+        return vectors
+
+
+def test_semantic_similarities_cover_exactly_the_shortlistable_folders():
+    embedder = _FakeEmbedder(favourite="Ordner: Finanzen > Depot")
+    sims = classifier.semantic_similarities(
+        embedder, DocumentQuery(correspondent="X", title="Depotauszug", text="text"), TREE, TREE_FILES, "Dokumente"
+    )
+    from depot.candidates import collapsed_folders
+
+    assert set(sims) == set(collapsed_folders(TREE, TREE_FILES))
+    assert sims["Dokumente/Finanzen/Depot"] == pytest.approx(1.0)
+    assert all(v == pytest.approx(0.0) for p, v in sims.items() if p != "Dokumente/Finanzen/Depot")
+    assert embedder.texts[0].startswith("Absender: X\nTitel: Depotauszug")
+    assert any(t.startswith("Ordner: Finanzen > Depot\nDateien: ") for t in embedder.texts[1:])
+
+
+def test_semantic_similarities_are_skipped_when_the_embedding_model_fails(caplog):
+    sims = classifier.semantic_similarities(
+        _FakeEmbedder(fail=True), DocumentQuery(title="x"), TREE, TREE_FILES, "Dokumente"
+    )
+    assert sims is None
+    assert "lexical only" in caplog.text
+
+
+def test_classify_hands_the_similarities_to_the_candidate_search(monkeypatch):
+    seen = {}
+    real_rank = classifier.candidate_search.rank_candidates
+
+    def spy_rank(query, folders, folder_files=None, limit=8, semantic=None):
+        seen["semantic"] = semantic
+        return real_rank(query, folders, folder_files, limit, semantic)
+
+    monkeypatch.setattr(classifier.candidate_search, "rank_candidates", spy_rank)
+    monkeypatch.setattr(classifier, "_pick_folder", _fake_pick("Dokumente/Finanzen/Depot"))
+    monkeypatch.setattr(classifier, "_decide_folder_step", _no_model_call)
+    content = ContentExtraction(
+        title="Depotauszug", correspondent="Musterbank", issue_date=date(2025, 1, 1), confidence=0.9
+    )
+
+    classifier.classify(
+        ocr_text="text", original_filename="scan.pdf", existing_folders=TREE, ollama_host="http://fake",
+        model="model", content=content, folder_files=TREE_FILES, embedder=_FakeEmbedder("Ordner: Finanzen > Depot"),
+    )
+    assert seen["semantic"]["Dokumente/Finanzen/Depot"] == pytest.approx(1.0)
+
+    classifier.classify(
+        ocr_text="text", original_filename="scan.pdf", existing_folders=TREE, ollama_host="http://fake",
+        model="model", content=content, folder_files=TREE_FILES,
+    )
+    assert seen["semantic"] is None  # no embedder: lexical only, as before
+
+
+def test_agreement_of_words_and_meaning_is_evidence_enough_to_file(monkeypatch):
+    """A folder with only moderate word overlap and no document of the
+    sender would go to Unsortiert - unless the embedding model independently
+    picks the same folder as the best match."""
+    letter = ContentExtraction(title="Rechnung Inspektion", correspondent="Werkstatt Nord", confidence=0.9)
+
+    def pick_first(ocr_text, original_filename, pdf_title, content, ranked, *a, **k):
+        best = ranked[0]
+        assert best.lexical_rank == 1
+        assert best.strength < classifier.STRONG_EVIDENCE and best.sender_files == 0
+        return (best.path, False, 0.9, [], best)
+
+    monkeypatch.setattr(classifier, "_pick_folder", pick_first)
+    monkeypatch.setattr(classifier, "_decide_folder_step", lambda *a, **k: _decision("stay", confidence=0.99))
+    kwargs = dict(
+        ocr_text="text", original_filename="scan.pdf", existing_folders=TREE, ollama_host="http://fake",
+        model="model", content=letter, folder_files=TREE_FILES,
+    )
+
+    outcome_plain, tags_plain = classifier.classify(**kwargs)
+    assert outcome_plain.confidence == classifier.CONFIDENCE_UNBACKED
+
+    favourite = "Ordner: " + " > ".join(outcome_plain.folder.split("/")[1:])
+    outcome_agreed, tags_agreed = classifier.classify(**kwargs, embedder=_FakeEmbedder(favourite))
+    assert outcome_agreed.folder == outcome_plain.folder
+    assert outcome_agreed.confidence == classifier.CONFIDENCE_AGREED
+    assert "WORT-UND-BEDEUTUNG-EINIG" in tags_agreed
+
+    # the embedding model preferring some other folder changes nothing
+    outcome_other, tags_other = classifier.classify(**kwargs, embedder=_FakeEmbedder("Ordner: Gesundheit"))
+    assert outcome_other.confidence == classifier.CONFIDENCE_UNBACKED
+    assert "WORT-UND-BEDEUTUNG-EINIG" not in tags_other

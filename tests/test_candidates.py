@@ -171,3 +171,63 @@ def test_sender_count_ignores_files_that_only_share_a_common_word():
     ranked = rank_candidates(DocumentQuery(correspondent="Praxiszentrum Berlin-Mitte", title="Bericht"), folders, files)
     assert all(c.sender_files == 0 for c in ranked)
 
+
+
+# ---- semantic half: embedding similarities blended into the order -----------
+
+def test_collapsed_folders_fold_years_and_drop_saved_page_assets():
+    from depot.candidates import collapsed_folders
+
+    folders = ["Dokumente/Bank", "Dokumente/Bank/2024", "Dokumente/Bank/2025", "Dokumente/Web/Seite_files"]
+    files = {"Dokumente/Bank/2024": ["a.pdf"], "Dokumente/Bank/2025": ["b.pdf"], "Dokumente/Web/Seite_files": ["x.css"]}
+    assert collapsed_folders(folders, files) == {"Dokumente/Bank": ["a.pdf", "b.pdf"]}
+
+
+def test_folder_and_document_texts_for_the_embedding_model():
+    from depot.candidates import document_text, folder_text
+
+    text = folder_text(
+        "Dokumente/Finanzen/Bank/2024", "Dokumente",
+        ["2024-03-01 Musterbank - Kontoauszug.pdf", "2024-04-01 Musterbank - Kontoauszug (2).pdf", "Notiz (Datum unsicher).pdf"],
+    )
+    assert text == "Ordner: Finanzen > Bank\nDateien: Musterbank - Kontoauszug; Notiz"
+    assert folder_text("Dokumente/Leer", "Dokumente", []) == "Ordner: Leer"
+
+    doc = document_text(DocumentQuery(
+        correspondent="Finanzamt", title="Steuerbescheid", keywords=["Steuer"], filename_title="Bescheid 2024",
+        text="  Viel   Text " * 200,
+    ))
+    assert doc.startswith("Absender: Finanzamt\nTitel: Steuerbescheid\nDateiname: Bescheid 2024\nStichworte: Steuer\nAuszug: Viel Text")
+    assert len(doc.split("Auszug: ")[1]) <= 400
+
+
+def test_semantic_similarity_lets_a_folder_without_word_overlap_into_the_list():
+    """The case words cannot solve: a CV titled in English and a folder
+    called "Lebenslauf"."""
+    folders = [*FOLDERS, "Dokumente/Arbeit/Lebenslauf"]
+    query = DocumentQuery(correspondent="", title="Curriculum Vitae", keywords=["career"])
+    lexical_only = [c.path for c in rank_candidates(query, folders, FILES)]
+    assert "Dokumente/Arbeit/Lebenslauf" not in lexical_only
+
+    semantic = {f: 0.3 for f in folders}
+    semantic["Dokumente/Arbeit/Lebenslauf"] = 0.9
+    ranked = rank_candidates(query, folders, FILES, semantic=semantic)
+    assert ranked[0].path == "Dokumente/Arbeit/Lebenslauf"
+    assert ranked[0].score == 0.0 and ranked[0].strength == 0.0  # order only; no lexical evidence invented
+    assert ranked[0].lexical_rank == 0  # by words it was not on the list at all
+    assert [c.lexical_rank for c in ranked[1:]] == [lexical_only.index(c.path) + 1 for c in ranked[1:]]
+
+
+def test_semantic_similarity_does_not_change_scores_or_sender_evidence():
+    query = DocumentQuery(correspondent="Beispiel Versicherung", title="Beitragsrechnung")
+    plain = {c.path: c for c in rank_candidates(query, FOLDERS, FILES)}
+    semantic = {f: 0.5 for f in FOLDERS}
+    semantic["Dokumente/Gesundheit"] = 0.95  # the model is quite sure it's health-related - it isn't
+    fused = rank_candidates(query, FOLDERS, FILES, semantic=semantic)
+    by_path = {c.path: c for c in fused}
+    for path, candidate in plain.items():
+        assert by_path[path].score == candidate.score
+        assert by_path[path].strength == candidate.strength
+        assert by_path[path].sender_files == candidate.sender_files
+    # the strong lexical match (sender's own documents) still comes first
+    assert fused[0].path == "Dokumente/Fahrzeuge/MT-07/Versicherung"
