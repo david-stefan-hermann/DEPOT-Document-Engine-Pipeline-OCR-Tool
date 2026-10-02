@@ -246,8 +246,8 @@ def main() -> None:
     print("\n=== Ergebnis ===")
     if "cand_rank" in rows[0]:
         for k in (1, 3, 5, 10):
-            exact = sum(0 < r["cand_rank"] <= k for r in rows)
-            near = sum(0 < r["cand_ancestor_rank"] <= k for r in rows)
+            exact = sum(0 < r.get("cand_rank", 0) <= k for r in rows)
+            near = sum(0 < r.get("cand_ancestor_rank", 0) <= k for r in rows)
             print(f"Kandidaten Top-{k:<2}: richtiger Ordner {exact:3d} / {n} ({exact / n:.0%}), "
                   f"Ordner oder ein Vorfahre {near:3d} / {n} ({near / n:.0%})")
     if args.stage == "full":

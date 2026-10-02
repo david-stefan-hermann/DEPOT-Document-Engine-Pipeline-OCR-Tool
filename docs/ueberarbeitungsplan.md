@@ -472,6 +472,31 @@ Vorauswahl und wird vorgeschlagen, einsortiert wird aber weiterhin nur mit Beleg
 neuer Extraktion); der frühere Einzelfall-Vergleich mit `gemma2:9b` sprach nicht für einen
 Wechsel.
 
+### 5e. Erster Produktivtest und Nachbesserungen (2026-10-02)
+
+Acht echte Scans nach dem Deploy: alle acht im richtigen Ordner (noch über den Cloud-Pfad —
+`use_anthropic_classifier` stand auf `true`), Stufenzeiten `ocr` 7–13 s, `llm` 8–12 s.
+Bemängelt wurden die Titel; daraus entstanden:
+
+- **Zeitraum im Titel** (Entgeltabrechnung/Zuzahlungsrechnung + Monat), **Kennzeichen und
+  Betrag** bei Bußgeldbescheiden/Verwarnungen — Regeln im Extraktions-Prompt.
+- **Umlaute**: Ursache war das Prompt selbst, das in "ae/ue" geschrieben war; jetzt mit
+  echten Umlauten, dazu `naming.restore_umlauts` als deterministische Korrektur gegen den
+  Dokumenttext.
+- **Absender ohne E-Mail-/Internetadresse** (`naming.strip_legal_form`).
+- **Nextcloud-Tags** "Depot" und "Neu" an jeder abgelegten Datei, "Datum unsicher" bei
+  geschätztem Datum.
+- **Absturz behoben**, den der Gegencheck fand: antwortet das Modell mit einem Datum wie
+  "0000-00-00", scheiterte das ganze Dokument ("year 0 is out of range") — im Betrieb
+  wäre es nach drei Versuchen in der Quarantäne gelandet. Jetzt gilt das als "kein Datum".
+
+Gegencheck der Prompt-Änderung (gleiche 120 Dokumente, lokaler Pfad mit
+`qwen3-embedding:0.6b`; der Baum enthielt inzwischen die Testscans, daher andere Stichprobe
+als in 5d): altes Prompt 68 exakt / 36 Unsortiert / 13 falsch / 1 Abbruch, neues Prompt
+69 / 35 / 14 / 0 — die Zuordnung ist unverändert. Die Titel wurden an den acht Testscans
+einzeln geprüft. Die Tag-Zuweisung ist nur gegen den Test-Server geprüft, nicht gegen die
+echte Nextcloud (lokal liegen keine Zugangsdaten).
+
 ### Phase 3 — Durchsatz und Robustheit
 
 - **3.1 Zwei Stufen**: OCR-Worker (CPU) → LLM-Worker (GPU, genau 1, damit der Prompt-Cache

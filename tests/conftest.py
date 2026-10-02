@@ -22,6 +22,47 @@ class FakeNextcloud:
     def __init__(self):
         self.collections: set[str] = set()
         self.files: dict[str, bytes] = {}
+        self.tags: dict[str, str] = {}  # tag id -> name
+        self.file_tags: dict[str, set[str]] = {}  # rel path -> tag names
+        self._file_ids: dict[str, str] = {}
+        self.tags_broken = False
+
+    def _file_id(self, rel: str) -> str:
+        return self._file_ids.setdefault(rel, str(1000 + len(self._file_ids)))
+
+    def _handle_tags(self, request: httpx.Request) -> httpx.Response:
+        if self.tags_broken:
+            return httpx.Response(503)
+        path = unquote(request.url.path)
+        if path.rstrip("/").endswith("/systemtags"):
+            if request.method == "PROPFIND":
+                items = "".join(
+                    f"<d:response><d:href>{path}/{tid}</d:href><d:propstat><d:prop><oc:id>{tid}</oc:id>"
+                    f"<oc:display-name>{escape(name)}</oc:display-name></d:prop></d:propstat></d:response>"
+                    for tid, name in self.tags.items()
+                )
+                body = f'<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">{items}</d:multistatus>'
+                return httpx.Response(207, content=body.encode("utf-8"))
+            if request.method == "POST":
+                import json as _json
+
+                name = _json.loads(request.content)["name"]
+                if name in self.tags.values():
+                    return httpx.Response(409)
+                tid = str(len(self.tags) + 1)
+                self.tags[tid] = name
+                return httpx.Response(201, headers={"Content-Location": f"/remote.php/dav/systemtags/{tid}"})
+        if "/systemtags-relations/files/" in path and request.method == "PUT":
+            file_id, tag_id = path.rstrip("/").rsplit("/", 2)[-2:]
+            rel = next((r for r, fid in self._file_ids.items() if fid == file_id), None)
+            if rel is None or tag_id not in self.tags:
+                return httpx.Response(404)
+            names = self.file_tags.setdefault(rel, set())
+            if self.tags[tag_id] in names:
+                return httpx.Response(409)
+            names.add(self.tags[tag_id])
+            return httpx.Response(201)
+        return httpx.Response(400)
 
     def _rel(self, url: httpx.URL) -> str:
         path = url.path
@@ -43,6 +84,8 @@ class FakeNextcloud:
         return body.encode("utf-8")
 
     def handle(self, request: httpx.Request) -> httpx.Response:
+        if "/systemtags" in request.url.path:
+            return self._handle_tags(request)
         rel = self._rel(request.url)
         method = request.method
 
@@ -50,6 +93,13 @@ class FakeNextcloud:
             exists = rel == "" or rel in self.collections or rel in self.files
             if not exists:
                 return httpx.Response(404)
+            if b"fileid" in request.content:
+                body = (
+                    '<d:multistatus xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns"><d:response><d:propstat>'
+                    f"<d:prop><oc:fileid>{self._file_id(rel)}</oc:fileid></d:prop></d:propstat></d:response>"
+                    "</d:multistatus>"
+                )
+                return httpx.Response(207, content=body.encode("utf-8"))
             is_coll = rel == "" or rel in self.collections
             entries = [(rel, is_coll)]
             if request.headers.get("Depth") == "1" and is_coll:

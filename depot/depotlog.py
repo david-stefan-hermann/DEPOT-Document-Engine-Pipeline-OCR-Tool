@@ -23,6 +23,7 @@ TAG_FILENAME_ONLY = "NUR-DATEINAME"
 TAG_DATE_FROM_FILENAME = "DATUM-AUS-DATEINAME"
 TAG_DATE_FROM_METADATA = "DATUM-AUS-PDF-METADATEN"
 TAG_DUPLICATE = "DUPLIKAT"
+TAG_TAGGING_FAILED = "NEXTCLOUD-TAGS-FEHLGESCHLAGEN"
 
 # The log write is a best-effort side channel, not part of the actual filing
 # operation (which has already completed by the time append() is called). A

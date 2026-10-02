@@ -219,3 +219,17 @@ def test_folder_pick_rejects_a_missing_or_empty_folder():
         FolderPick.model_validate({"confidence": 0.5})
     with pytest.raises(ValidationError):
         FolderPick.model_validate({"folder": "", "confidence": 0.5})
+
+
+def test_unparseable_issue_date_becomes_no_date_instead_of_crashing():
+    """Real case: the model answered "0000-00-00"; pydantic raised a bare
+    ValueError ("year 0 is out of range") that failed the whole document."""
+    for bad in ("0000-00-00", "0000-01-01", "2026-13-45", "unbekannt", ""):
+        content = ContentExtraction.model_validate(
+            {"title": "Police", "correspondent": "AXA", "issue_date": bad, "confidence": 0.8}
+        )
+        assert content.issue_date is None
+    ok = ContentExtraction.model_validate(
+        {"title": "Police", "correspondent": "AXA", "issue_date": "2025-05-20", "confidence": 0.8}
+    )
+    assert ok.issue_date.isoformat() == "2025-05-20"

@@ -142,3 +142,28 @@ def test_normalize_correspondent_takes_the_spelling_already_in_use():
     assert naming.normalize_correspondent("Muster GmbH", known) == "Muster"
     assert naming.normalize_correspondent("Ganz Anderer Absender AG", known) == "Ganz Anderer Absender"
     assert naming.normalize_correspondent("", known) == ""
+
+
+# ---- umlauts and sender cleanup ---------------------------------------------
+
+def test_restore_umlauts_only_where_the_document_writes_them():
+    from depot.naming import restore_umlauts
+
+    text = "Schreiben über die Änderung Ihrer Steuerklasse. Aktuelle Bußgeldstelle, Straße 1, Wasser"
+    assert restore_umlauts("Schreiben ueber Aenderung der Steuerklasse", text) == "Schreiben über Änderung der Steuerklasse"
+    assert restore_umlauts("Bussgeldstelle Strasse", text) == "Bußgeldstelle Straße"
+    # words that merely contain ae/oe/ue/ss keep their spelling
+    assert restore_umlauts("Steuerklasse aktuelle Wasser", text) == "Steuerklasse aktuelle Wasser"
+    # the document itself uses the plain spelling: leave it
+    assert restore_umlauts("Mueller Rechnung", "Rechnung von Mueller und Müller") == "Mueller Rechnung"
+    # not in the document at all: no guessing
+    assert restore_umlauts("Pruefbericht", "Bericht") == "Pruefbericht"
+    assert restore_umlauts("Pruefbericht", "") == "Pruefbericht"
+
+
+def test_sender_loses_mail_addresses_and_the_letter_left_behind():
+    from depot.naming import normalize_correspondent
+
+    assert normalize_correspondent("Polizei Berlin L bussgeldstelle@bowi.berlin.de") == "Polizei Berlin"
+    assert normalize_correspondent("Musterwerke GmbH www.musterwerke.de") == "Musterwerke"
+    assert normalize_correspondent("Kanzlei B") == "Kanzlei B"  # no address involved: untouched

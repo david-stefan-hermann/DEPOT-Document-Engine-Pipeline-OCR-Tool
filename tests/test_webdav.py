@@ -60,3 +60,34 @@ def test_folder_names_with_umlauts_and_spaces(client):
     assert client.get("Dokumente/Straßenverkehr/Bußgeldbescheide/2026-01-01 Bescheid.pdf") == b"x"
     folders = client.list_folders_recursive("Dokumente")
     assert "Dokumente/Straßenverkehr/Bußgeldbescheide" in folders
+
+
+def test_tag_file_creates_missing_tags_once_and_is_idempotent(fake_server, client):
+    client.mkcol("Dokumente")
+    client.put("Dokumente/a.pdf", b"x")
+    client.put("Dokumente/b.pdf", b"y")
+
+    client.tag_file("Dokumente/a.pdf", ["Depot", "Neu"])
+    client.tag_file("Dokumente/a.pdf", ["Depot"])  # already tagged: no error
+    client.tag_file("Dokumente/b.pdf", ["Depot", "Datum unsicher"])
+
+    assert fake_server.file_tags == {
+        "Dokumente/a.pdf": {"Depot", "Neu"},
+        "Dokumente/b.pdf": {"Depot", "Datum unsicher"},
+    }
+    assert sorted(fake_server.tags.values()) == ["Datum unsicher", "Depot", "Neu"]
+
+
+def test_tag_file_uses_a_tag_that_already_exists_on_the_server(fake_server, client):
+    fake_server.tags["7"] = "Depot"
+    client.put("a.pdf", b"x")
+    client.tag_file("a.pdf", ["Depot"])
+    assert list(fake_server.tags.items()) == [("7", "Depot")]
+    assert fake_server.file_tags == {"a.pdf": {"Depot"}}
+
+
+def test_tag_file_on_a_missing_file_raises(fake_server, client):
+    import pytest
+
+    with pytest.raises(RuntimeError, match="No file id"):
+        client.tag_file("gone.pdf", ["Depot"])

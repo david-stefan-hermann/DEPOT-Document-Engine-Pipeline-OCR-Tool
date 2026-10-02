@@ -53,6 +53,13 @@ LOCAL_FOLDER_CACHE_TTL_SECONDS = 15.0
 # folder decision's own confidence still applies on top.
 FILENAME_ONLY_CONFIDENCE = 0.7
 
+# Nextcloud tags (the ones searchable in the Files app) set on everything
+# DEPOT files: where it came from, that nobody has looked at it yet, and -
+# so these can be found in one search - that its date is a guess.
+NEXTCLOUD_TAG_DEPOT = "Depot"
+NEXTCLOUD_TAG_NEW = "Neu"
+NEXTCLOUD_TAG_DATE_UNCERTAIN = "Datum unsicher"
+
 
 @dataclass
 class PreparedDocument:
@@ -440,6 +447,19 @@ class Pipeline:
             self._known_folders.add(folder)
         return dest_rel
 
+    def _tag_in_nextcloud(self, dest_rel: str, log_tags: list[str], date_uncertain: bool = False) -> None:
+        """Best effort: the document is filed either way, so a failure here
+        is noted in the log line instead of failing (and re-filing) it."""
+        names = [NEXTCLOUD_TAG_DEPOT, NEXTCLOUD_TAG_NEW]
+        if date_uncertain:
+            names.append(NEXTCLOUD_TAG_DATE_UNCERTAIN)
+        try:
+            self.webdav.tag_file(dest_rel, names)
+        except Exception as exc:
+            log.warning("Could not tag %s in Nextcloud: %s", dest_rel, exc)
+            if depotlog.TAG_TAGGING_FAILED not in log_tags:
+                log_tags.append(depotlog.TAG_TAGGING_FAILED)
+
     def _processed_folder(self) -> str:
         cfg = self.config
         return f"{cfg.scan_eingang_webdav_path}/{cfg.config_subfolder}/{cfg.processed_subfolder}"
@@ -452,10 +472,11 @@ class Pipeline:
         folder = self.config.fallback_folder if file_into_dokumente else self._processed_folder()
         name = naming.duplicate_filename(prior_dest.rsplit("/", 1)[-1], path.suffix)
         dest_rel = self._put_with_collision_resolution(folder, name, path.read_bytes())
-        self._delete_source(path.name)
         tags = [depotlog.TAG_DUPLICATE]
         if file_into_dokumente:
             tags.append(depotlog.TAG_UNSORTED)
+        self._tag_in_nextcloud(dest_rel, tags)
+        self._delete_source(path.name)
         self.depot_log.append(path.name, f"Duplikat von {prior_dest}", tags=tags, path=dest_rel)
         log.info("Duplicate %s (same content as %s) -> %s", path.name, prior_dest, dest_rel)
 
@@ -647,6 +668,7 @@ class Pipeline:
         if target_folder is not None:
             self._remember_folder(target_folder)
             dest_rel = self._put_with_collision_resolution(target_folder, desired_name, produced_bytes)
+            self._tag_in_nextcloud(dest_rel, tags, date_uncertain=issue_date is None)
 
         processed_rel: str | None = None
         if prepared.save_processed_copy:
@@ -654,6 +676,7 @@ class Pipeline:
                 self._processed_folder(), desired_name, produced_bytes
             )
             tags.append(depotlog.TAG_PROCESSED_COPY)
+            self._tag_in_nextcloud(processed_rel, tags, date_uncertain=issue_date is None)
 
         if dest_rel is None and processed_rel is None:
             # Defense in depth: load_processing_switches() already forces

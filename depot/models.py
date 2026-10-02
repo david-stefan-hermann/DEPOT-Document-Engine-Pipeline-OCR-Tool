@@ -84,6 +84,21 @@ class ContentExtraction(BaseModel):
     def _strip_correspondent(cls, v: str) -> str:
         return v.strip()
 
+    @field_validator("issue_date", mode="before")
+    @classmethod
+    def _unparseable_date_is_no_date(cls, v: object) -> object:
+        # The model sometimes fills in "0000-00-00" when it finds no date.
+        # pydantic lets that escape as a bare ValueError ("year 0 is out of
+        # range"), which failed the whole document - three times, i.e. into
+        # quarantine, since the model answers the same every time.
+        if isinstance(v, str):
+            try:
+                return date.fromisoformat(v.strip())
+            except ValueError:
+                log.warning("Model returned an unparseable issue_date %r; discarding it.", v)
+                return None
+        return v
+
     @field_validator("issue_date")
     @classmethod
     def _reject_implausible_date(cls, v: date | None) -> date | None:

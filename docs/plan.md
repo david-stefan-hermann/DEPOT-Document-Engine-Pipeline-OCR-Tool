@@ -254,6 +254,13 @@ pipeline.py — zwei Stufen, damit CPU und GPU gleichzeitig arbeiten:
    │           (direkte Dateisystem-Schreibzugriffe erzeugen sonst unsichtbare
    │           "Ghost-Dateien" bis ein manueller `occ files:scan` läuft)
    │
+   ├─► Nextcloud-Tags (webdav.tag_file, seit 2026-10-02): jede abgelegte Datei
+   │           bekommt die Tags "Depot" und "Neu", bei geschätztem Datum zusätzlich
+   │           "Datum unsicher" — in der Dateien-App durchsuchbar. Tags werden bei
+   │           Bedarf angelegt (<dav>/systemtags) und über die Datei-ID zugewiesen
+   │           (<dav>/systemtags-relations/files/<id>/<tag>). Schlägt das fehl, bleibt
+   │           die Ablage gültig; die Logzeile trägt [NEXTCLOUD-TAGS-FEHLGESCHLAGEN].
+   │
    └─► depotlog.py: eigene Logdatei pro Verarbeitungs-Event unter
                Scan Eingang/Depot Config/DEPOT Dateilog DD-MM-YYYY HH-MM-SS.txt
                schreiben, inkl. Sondermarkierung für [OCR-FEHLGESCHLAGEN],
@@ -297,6 +304,15 @@ CPU-only auf dem TrueNAS-Server; siehe [infrastructure-setup.md](infrastructure-
 für den aktuellen Stand zu GPU-Beschleunigung.
 
 ## Dateiname-Konvention
+
+Titelregeln im Extraktions-Prompt (Stand 2026-10-02, aus Rückmeldungen zum Produktivtest):
+Dokumente für einen Zeitraum tragen ihn im Titel ("Entgeltabrechnung August 2026",
+"Zuzahlungsrechnung Juli 2026"); Bußgeldbescheide/Verwarnungen tragen Kennzeichen und
+Betrag ("Bußgeldbescheid B-XY 123 - 28,50 EUR"); Fahrzeug-/Gerätedokumente ihre Kennung.
+Umlaute: das Prompt ist selbst mit echten Umlauten geschrieben (das frühere, in "ae/ue"
+umschriebene Prompt hat dem Modell die Ersatzschreibung vorgemacht), und
+`naming.restore_umlauts` korrigiert danach jedes Wort, das im Dokument mit Umlaut/ß steht.
+Aus dem Absender werden E-Mail- und Internetadressen entfernt.
 
 `YYYY-MM-DD [Absender - ]Titel.ext`, z.B. `2026-07-15 Stadtwerke München -
 Stromrechnung Juli.pdf`, ohne erkennbaren Absender weiterhin schlicht
@@ -442,7 +458,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (275 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (284 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

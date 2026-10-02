@@ -59,9 +59,49 @@ _FILED_NAME = re.compile(r"^\d{4}-\d{2}-\d{2} (.+?) - .+")
 KNOWN_CORRESPONDENT_THRESHOLD = 0.9
 
 
+_CONTACT_DETAIL = re.compile(r"\S+@\S+|(?:https?://|www\.)\S+")
+_DANGLING_LETTER = re.compile(r"\s+\S$")
+
+_TRANSLITERATION = (("ae", "ä"), ("oe", "ö"), ("ue", "ü"), ("Ae", "Ä"), ("Oe", "Ö"), ("Ue", "Ü"), ("ss", "ß"))
+_WORD = re.compile(r"[^\W\d_]+")
+
+
+def restore_umlauts(text: str, reference: str) -> str:
+    """Undo "ae/oe/ue/ss" spellings the model produced for words that the
+    document itself writes with an umlaut or ß (seen in production: a title
+    "Schreiben ueber Änderung ..." for a letter that says "über").
+
+    A word is only changed when the document contains the umlaut spelling
+    and NOT the spelling as given - "Steuer", "aktuell" or "Wasser" are
+    never touched, because no "Steür"/"aktüll"/"Waßer" occurs in any text."""
+    # lower(), not casefold(): casefold turns "ß" into "ss" and would make
+    # the two spellings indistinguishable.
+    reference_words = {w.lower() for w in _WORD.findall(normalize(reference))}
+    if not reference_words:
+        return text
+
+    def fix(match: re.Match) -> str:
+        word = match[0]
+        if word.lower() in reference_words:
+            return word
+        candidates = {word}
+        for plain, umlaut in _TRANSLITERATION:
+            candidates |= {c.replace(plain, umlaut) for c in candidates}
+        hits = [c for c in candidates if c != word and c.lower() in reference_words]
+        return hits[0] if len(hits) == 1 else word
+
+    return _WORD.sub(fix, normalize(text))
+
+
 def strip_legal_form(correspondent: str) -> str:
-    """"Stadtwerke Muenchen GmbH, 80331 Muenchen" -> "Stadtwerke Muenchen"."""
-    name = _TRAILING_ADDRESS.sub("", normalize(correspondent))
+    """"Stadtwerke Muenchen GmbH, 80331 Muenchen" -> "Stadtwerke Muenchen".
+    Also drops e-mail/web addresses that slipped in from the letterhead
+    (seen: "Polizei Berlin L bussgeldstelle@...") and the stray single
+    letter such a removal leaves behind."""
+    name = normalize(correspondent)
+    if _CONTACT_DETAIL.search(name):
+        name = _DANGLING_LETTER.sub("", " ".join(_CONTACT_DETAIL.sub(" ", name).split()))
+    name = _TRAILING_ADDRESS.sub("", name)
     previous = None
     while previous != name:
         previous = name

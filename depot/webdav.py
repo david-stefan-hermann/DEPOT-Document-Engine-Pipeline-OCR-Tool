@@ -21,6 +21,21 @@ _PROPFIND_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
 """
 
 
+_OC_NS = "{http://owncloud.org/ns}"
+
+_FILEID_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop><oc:fileid/></d:prop>
+</d:propfind>
+"""
+
+_TAGS_BODY = b"""<?xml version="1.0" encoding="utf-8"?>
+<d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">
+  <d:prop><oc:id/><oc:display-name/></d:prop>
+</d:propfind>
+"""
+
+
 class PreconditionFailed(RuntimeError):
     """A conditional request (PUT with If-None-Match: *) was refused because
     the target already exists."""
@@ -54,6 +69,7 @@ class WebDavClient:
             follow_redirects=True,
             transport=transport,
         )
+        self._tag_cache: dict[str, str] = {}
 
     def close(self) -> None:
         self._client.close()
@@ -188,6 +204,67 @@ class WebDavClient:
             raise RuntimeError(
                 f"DELETE {rel_path!r} failed: HTTP {resp.status_code} {resp.text[:300]}"
             )
+
+    # ---- Nextcloud system tags ("Tags" in the Files app) -------------------
+    # Not part of the files WebDAV tree: tags live under <dav>/systemtags and
+    # are attached to a file by its numeric id under
+    # <dav>/systemtags-relations/files/<fileid>/<tagid>.
+
+    def _dav_url(self, path: str) -> str:
+        root, sep, _ = self._base_url.partition("/remote.php/dav")
+        if not sep:
+            raise RuntimeError("Tags need a Nextcloud WebDAV URL (…/remote.php/dav/files/<user>)")
+        return f"{root}/remote.php/dav/{path.lstrip('/')}"
+
+    def file_id(self, rel_path: str) -> str | None:
+        resp = self._client.request(
+            "PROPFIND", self._url_for(rel_path), headers={"Depth": "0"}, content=_FILEID_BODY
+        )
+        if resp.status_code >= 300:
+            return None
+        return ET.fromstring(resp.content).findtext(f".//{_OC_NS}fileid") or None
+
+    def _tag_ids(self) -> dict[str, str]:
+        resp = self._client.request(
+            "PROPFIND", self._dav_url("systemtags"), headers={"Depth": "1"}, content=_TAGS_BODY
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(f"Listing tags failed: HTTP {resp.status_code} {resp.text[:300]}")
+        tags: dict[str, str] = {}
+        for response in ET.fromstring(resp.content).findall(f"{_DAV_NS}response"):
+            tag_id = response.findtext(f".//{_OC_NS}id")
+            name = response.findtext(f".//{_OC_NS}display-name")
+            if tag_id and name:
+                tags[name] = tag_id
+        return tags
+
+    def ensure_tag(self, name: str) -> str:
+        """The id of the tag called `name`, creating the tag if needed."""
+        if name not in self._tag_cache:
+            self._tag_cache = self._tag_ids()
+        if name not in self._tag_cache:
+            resp = self._client.post(
+                self._dav_url("systemtags"),
+                json={"name": name, "userVisible": True, "userAssignable": True},
+            )
+            if resp.status_code == 201 and resp.headers.get("Content-Location"):
+                self._tag_cache[name] = resp.headers["Content-Location"].rstrip("/").rsplit("/", 1)[-1]
+            elif resp.status_code == 409:  # created by someone else just now
+                self._tag_cache = self._tag_ids()
+            else:
+                raise RuntimeError(f"Creating tag {name!r} failed: HTTP {resp.status_code} {resp.text[:300]}")
+        return self._tag_cache[name]
+
+    def tag_file(self, rel_path: str, names: list[str]) -> None:
+        """Attach the tags `names` to the file (creating missing tags)."""
+        file_id = self.file_id(rel_path)
+        if file_id is None:
+            raise RuntimeError(f"No file id for {rel_path!r}; cannot tag it")
+        for name in names:
+            tag_id = self.ensure_tag(name)
+            resp = self._client.put(self._dav_url(f"systemtags-relations/files/{file_id}/{tag_id}"))
+            if resp.status_code not in (201, 204, 409):  # 409 = already tagged
+                raise RuntimeError(f"Tagging {rel_path!r} with {name!r} failed: HTTP {resp.status_code}")
 
     def move(self, src_rel_path: str, dst_rel_path: str, overwrite: bool = False) -> None:
         resp = self._client.request(

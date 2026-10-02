@@ -1196,3 +1196,68 @@ def test_folder_missing_on_the_mount_is_created_via_webdav(tmp_path, client, fak
     assert "Dokumente/Neu" in fake_server.collections
     p.state.close()
 
+
+
+# ---- Nextcloud tags on everything DEPOT files -------------------------------
+
+def test_filed_document_gets_the_depot_and_neu_tags(monkeypatch, tmp_path, pipeline, fake_server, client):
+    from datetime import date
+
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(
+        ocr, "process_file",
+        lambda path, language: OcrResult(text="Datum 15.07.2026", page_count=1, ocr_pdf_path=str(path), ocr_failed=False),
+    )
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **kwargs: (
+            ClassificationOutcome(folder="Dokumente/Energie", is_new_folder=False, title="Stromrechnung",
+                                  issue_date=date(2026, 7, 15), confidence=0.9),
+            [],
+        ),
+    )
+
+    pipeline.process_one(scan)
+
+    assert fake_server.file_tags == {"Dokumente/Energie/2026-07-15 Stromrechnung.pdf": {"Depot", "Neu"}}
+
+
+def test_document_without_a_date_also_gets_the_datum_unsicher_tag(monkeypatch, tmp_path, pipeline, fake_server, client):
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _text_ocr("kein Datum im Text"))
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Zeugnisse", title="Zeugnis"))
+
+    pipeline.process_one(scan)
+    pipeline.process_one(_seed_and_return(pipeline, client, tmp_path, "scan2.pdf"))  # tags are reused, not recreated
+
+    (first, second) = sorted(fake_server.file_tags)
+    assert "(Datum unsicher)" in first
+    assert fake_server.file_tags[first] == {"Depot", "Neu", "Datum unsicher"}
+    assert fake_server.file_tags[second] == {"Depot", "Neu", "Datum unsicher"}
+    assert sorted(fake_server.tags.values()) == ["Datum unsicher", "Depot", "Neu"]
+    assert "DATUM-UNSICHER" in "".join(
+        client.get(p).decode("utf-8") for p in fake_server.files if "DEPOT Dateilog" in p
+    )
+
+
+def _seed_and_return(pipeline, client, tmp_path, name):
+    scan = _make_scan(tmp_path, name=name, content=b"%PDF-" + name.encode())
+    _seed_source_on_server(pipeline, client, scan)
+    return scan
+
+
+def test_failing_tag_api_does_not_stop_the_filing(monkeypatch, tmp_path, pipeline, fake_server, client):
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(pipeline, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _text_ocr())
+    monkeypatch.setattr(classifier, "classify", _classify_into("Dokumente/Gesundheit"))
+    fake_server.tags_broken = True
+
+    pipeline.process_one(scan)
+
+    assert len([p for p in fake_server.files if p.startswith("Dokumente/Gesundheit/")]) == 1
+    assert client.get(f"Scan-Eingang/{scan.name}") is None
+    assert "NEXTCLOUD-TAGS-FEHLGESCHLAGEN" in _get_log_text(fake_server, client)
+    assert pipeline.state.should_quarantine(scan.name) is False

@@ -20,7 +20,7 @@ from depot.models import (
     FolderStepDecision,
     extraction_json_schema,
 )
-from depot.naming import closest_existing_leaf, known_correspondents, normalize_correspondent
+from depot.naming import closest_existing_leaf, known_correspondents, normalize_correspondent, restore_umlauts
 
 log = logging.getLogger(__name__)
 
@@ -107,60 +107,74 @@ _CONTENT_SYSTEM_PROMPT = """\
 Du extrahierst Kerninformationen aus einem gescannten Dokument.
 
 Regeln:
-- "correspondent" ist der Absender/Aussteller des Dokuments (Firma, Behoerde, \
+- "correspondent" ist der Absender/Aussteller des Dokuments (Firma, Behörde, \
 Institution) - PFLICHTFELD, darf so gut wie nie leer sein. Kurz und \
-wiedererkennbar, z.B. "Stadtwerke Muenchen" statt "Stadtwerke Muenchen \
+wiedererkennbar, z.B. "Stadtwerke München" statt "Stadtwerke München \
 Servicegesellschaft mbH". Suche AKTIV im Briefkopf, in der Absenderzeile \
-oder der Fusszeile nach einem Firmen-/Behoerden-/Kassennamen. Auch Aemter, \
-Kassen und Vereine zaehlen als correspondent, nicht nur Firmen im \
-GmbH-Sinne: steht im Text z.B. "Finanzamt Muenchen" oder nur "Finanzamt", \
+oder der Fußzeile nach einem Firmen-/Behörden-/Kassennamen. Auch Ämter, \
+Kassen und Vereine zählen als correspondent, nicht nur Firmen im \
+GmbH-Sinne: steht im Text z.B. "Finanzamt München" oder nur "Finanzamt", \
 nutze GENAU das. NUR wenn im GESAMTEN Text wirklich kein einziger \
 Absenderhinweis existiert (z.B. eine private handschriftliche Notiz ganz \
 ohne Briefkopf), ist ein leerer String "" erlaubt - das ist der \
 Ausnahmefall, nicht der Normalfall. Der Absender darf NICHT nochmal im \
 "title" wiederholt werden.
-- "title" ist ein kurzer, praegnanter Betreff OHNE den Absendernamen (der \
-steht bereits in "correspondent"), ohne Datum, ohne Dateiendung und ohne \
-Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli" oder "Bussgeldbescheid". \
-Referenznummern gehoeren NIEMALS in den Titel.
+- "title" ist ein kurzer, prägnanter Betreff OHNE den Absendernamen (der \
+steht bereits in "correspondent"), ohne das Ausstellungsdatum, ohne \
+Dateiendung und ohne Rechnungs-/Kundennummern, z.B. "Stromrechnung Juli 2026". \
+Referenznummern gehören NIEMALS in den Titel.
+- Schreibe Titel und Absender mit echten Umlauten und ß, so wie sie im \
+Dokument stehen ("Änderung", "über", "Bußgeld") - NIEMALS die Ersatzschreibung \
+"ae", "oe", "ue", "ss". E-Mail-Adressen, Internetadressen und Telefonnummern \
+gehören weder in den Absender noch in den Titel.
+- Gilt das Dokument für einen bestimmten ZEITRAUM (Abrechnungsmonat, Quartal, \
+Jahr) - z.B. Gehalts-/Entgeltabrechnung, Zuzahlungsrechnung, Kontoauszug, \
+Nebenkostenabrechnung, Beitragsrechnung -, dann gehört dieser Zeitraum IMMER \
+ausgeschrieben in den Titel: "Entgeltabrechnung August 2026", \
+"Zuzahlungsrechnung Juli 2026", "Nebenkostenabrechnung 2025". Der Zeitraum \
+ist das, was mehrere gleichnamige Dokumente desselben Absenders unterscheidet; \
+er ist NICHT das Ausstellungsdatum.
+- Bei Bußgeldbescheiden, Verwarnungen und Anhörungen im Straßenverkehr gehören \
+das amtliche Kennzeichen und der geforderte Gesamtbetrag in den Titel: \
+"Bußgeldbescheid B-XY 123 - 28,50 EUR".
 - Hat das Dokument einen offiziellen Formular-/Dokumenttyp-Namen (Rechnung, \
-Bescheid, Bescheinigung, Mahnung, Pruefbericht, Vertrag, ...), nutze GENAU \
-diesen als Kern des Titels. Ist es dagegen ein freier, persoenlich \
+Bescheid, Bescheinigung, Mahnung, Prüfbericht, Vertrag, ...), nutze GENAU \
+diesen als Kern des Titels. Ist es dagegen ein freier, persönlich \
 adressierter Brief OHNE einen solchen offiziellen Dokumenttyp (erkennbar an \
 "Sehr geehrte(r) ...", einer direkten Anrede, einem freien Anliegen statt \
-einem Formular), leite den Titel aus dem TATSAECHLICHEN Anliegen/Thema des \
+einem Formular), leite den Titel aus dem TATSÄCHLICHEN Anliegen/Thema des \
 Brieftexts ab (worum es inhaltlich geht) - NIEMALS eine generische \
-Bezeichnung wie "Schreiben", "Mitteilung" oder "Buergerbrief" verwenden, \
+Bezeichnung wie "Schreiben", "Mitteilung" oder "Bürgerbrief" verwenden, \
 die nur die Textsorte statt des Inhalts benennt.
 - Bezieht sich das Dokument erkennbar auf ein konkretes physisches Objekt, \
-das der Nutzer mehrfach besitzen koennte (z.B. ein Fahrzeug, ein \
-Geraet), und steht im Text eine eindeutige Kennung dafuer (amtliches \
+das der Nutzer mehrfach besitzen könnte (z.B. ein Fahrzeug, ein \
+Gerät), und steht im Text eine eindeutige Kennung dafür (amtliches \
 Kennzeichen, Seriennummer, Fahrgestellnummer), nimm diese Kennung mit in \
 den Titel auf - das unterscheidet sonst gleichnamige Dokumente \
-(z.B. "Pruefbericht B-XY 123" statt nur "Pruefbericht"). Das ist KEINE \
-Rechnungs-/Kundennummer und faellt nicht unter das Verbot oben.
+(z.B. "Prüfbericht B-XY 123" statt nur "Prüfbericht"). Das ist KEINE \
+Rechnungs-/Kundennummer und fällt nicht unter das Verbot oben.
 - "issue_date" ist das Ausstellungs-/Erstellungsdatum DIESES Dokuments selbst \
 (wann es geschrieben/gedruckt/verschickt wurde) - NICHT irgendein anderes \
-Datum, das im Dokument zufaellig vorkommt. Formulare wie Gehalts-/ \
+Datum, das im Dokument zufällig vorkommt. Formulare wie Gehalts-/ \
 Entgeltabrechnungen enthalten oft MEHRERE Datumsangaben, die NICHTS mit dem \
 Ausstellungsdatum zu tun haben: Geburtsdatum, Eintrittsdatum, Austrittsdatum, \
-Referenzdatum u.ae. - diese Personaldaten sind NIEMALS issue_date, auch wenn \
+Referenzdatum u.ä. - diese Personaldaten sind NIEMALS issue_date, auch wenn \
 sie im selben Zeitraum liegen wie das Dokument. Suche stattdessen gezielt \
-nach einem Feld, das woertlich "Datum" heisst (oft in einer Kopfzeile nahe \
+nach einem Feld, das wörtlich "Datum" heißt (oft in einer Kopfzeile nahe \
 "Seite"/"Kundennummer"/"Kostenstelle") oder dem Datum am Ende/in der \
-Fusszeile des Schreibens. Bist du zwischen mehreren Datumsangaben unsicher, \
+Fußzeile des Schreibens. Bist du zwischen mehreren Datumsangaben unsicher, \
 welches das echte Ausstellungsdatum ist, setze issue_date auf null und \
 senke die confidence, statt zu raten oder Ziffern aus verschiedenen Daten \
 zu vermischen. Format YYYY-MM-DD, oder null falls nicht sicher ermittelbar. \
 Deutsche Datumsangaben im Text sind TT.MM.JJJJ (Tag zuerst) - wandle sie \
-sorgfaeltig um, ohne Ziffern zu vertauschen. Beispiel: "31.07.2026" im Text \
+sorgfältig um, ohne Ziffern zu vertauschen. Beispiel: "31.07.2026" im Text \
 bedeutet issue_date "2026-07-31" (Jahr-Monat-Tag), NICHT "3107-07-20" oder \
-aehnliche Vertauschungen.
+ähnliche Vertauschungen.
 - "keywords" sind 3 bis 6 allgemeine Stichworte zu Dokumentart und Thema \
 (z.B. ["Rechnung", "Strom", "Jahresabrechnung"]), die helfen, das Dokument \
 einer Ablage-Kategorie zuzuordnen. KEINE personenbezogenen Angaben: keine \
-Personennamen, Adressen, Nummern, Betraege oder Datumsangaben.
-- "confidence" ist deine eigene Einschaetzung (0.0-1.0), wie sicher du bei \
+Personennamen, Adressen, Nummern, Beträge oder Datumsangaben.
+- "confidence" ist deine eigene Einschätzung (0.0-1.0), wie sicher du bei \
 Titel UND Datum bist. Sei ehrlich niedrig, wenn der Text schlecht lesbar \
 oder mehrdeutig ist.
 - Antworte AUSSCHLIESSLICH mit einem JSON-Objekt passend zum vorgegebenen Schema.
@@ -488,9 +502,13 @@ def extract_content(
     raw_content = _chat("extract", ollama_host, model, messages, extraction_json_schema(), timeout)
     try:
         payload = json.loads(raw_content)
-        return ContentExtraction.model_validate(payload)
+        content = ContentExtraction.model_validate(payload)
     except (json.JSONDecodeError, ValidationError) as exc:
         raise RuntimeError(f"Model returned invalid content-extraction JSON: {exc}") from exc
+    return content.model_copy(update={
+        "title": restore_umlauts(content.title, ocr_text),
+        "correspondent": restore_umlauts(content.correspondent, ocr_text),
+    })
 
 
 def _decide_folder_step(
