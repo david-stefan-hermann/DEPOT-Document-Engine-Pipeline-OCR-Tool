@@ -14,8 +14,11 @@ Stages (--stage):
               folder decision: is the right folder among the candidates?
   full        everything, as in production (default)
 
-Runs the LOCAL classifier only (Ollama); document text never leaves the
-machines it would reach in normal operation. Results and the extraction
+Runs the LOCAL classifier (Ollama) unless --cloud is given; document text
+never leaves the machines it would reach in normal operation. With --cloud
+the folder decision is made by Anthropic exactly as in production with
+`use_anthropic_classifier`: sender, title, keywords and the folder list of
+every test document are sent there (never the text) - API costs apply. Results and the extraction
 cache (which contain real document names) go to eval-results/, which is
 gitignored - never commit them, this repository is public.
 
@@ -132,6 +135,9 @@ def main() -> None:
     parser.add_argument("--model", default=os.environ.get("OLLAMA_MODEL", "qwen2.5:7b-instruct-q4_K_M"))
     parser.add_argument("--embedding-model", default=os.environ.get("EMBEDDING_MODEL", ""),
                         help="Ollama embedding model for the semantic half of the shortlist ('' = lexical only)")
+    parser.add_argument("--cloud", action="store_true",
+                        help="folder decision via Anthropic (needs ANTHROPIC_API_KEY, e.g. from .env)")
+    parser.add_argument("--anthropic-model", default=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5"))
     parser.add_argument("--depot-path", type=Path, default=Path(__file__).resolve().parent.parent,
                         help="checkout whose depot/ package is evaluated (for comparing two versions)")
     parser.add_argument("--label", default="", help="name for this run, used in the output filename")
@@ -149,6 +155,15 @@ def main() -> None:
         from depot.embeddings import Embedder  # noqa: E402
 
         embedder = Embedder(args.ollama_host, args.embedding_model, RESULTS_DIR / "embedding-cache.sqlite3")
+
+    anthropic_api_key = None
+    if args.cloud:
+        from dotenv import load_dotenv
+
+        load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+        anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not anthropic_api_key:
+            parser.error("--cloud needs ANTHROPIC_API_KEY (environment or .env)")
 
     tree: Path = args.tree.resolve()
     root = tree.name
@@ -222,9 +237,18 @@ def main() -> None:
             if "resolve_date" in classify_params:
                 kwargs["resolve_date"] = lambda d: signals.resolve_issue_date(
                     d, text, name_signals, None, date.today())[0]
-            if embedder is not None and "embedder" in classify_params:
-                kwargs["embedder"] = embedder
-            outcome, tags = classifier.classify(**kwargs)
+            if args.cloud:
+                kwargs.pop("folder_files", None)
+                outcome, tags = classifier.classify_via_anthropic(
+                    **kwargs, folder_files=loo_files, filename_title=name_signals.title,
+                    anthropic_api_key=anthropic_api_key, anthropic_model=args.anthropic_model,
+                )
+                if "ANTHROPIC-NICHT-ERREICHBAR" in tags:
+                    raise RuntimeError("Anthropic call failed")
+            else:
+                if embedder is not None and "embedder" in classify_params:
+                    kwargs["embedder"] = embedder
+                outcome, tags = classifier.classify(**kwargs)
             seconds = extract_seconds + time.perf_counter() - started
             verdict = _verdict(truth, outcome.folder, outcome.confidence >= args.threshold)
             row.update(predicted=outcome.folder, confidence=f"{outcome.confidence:.2f}", verdict=verdict,
