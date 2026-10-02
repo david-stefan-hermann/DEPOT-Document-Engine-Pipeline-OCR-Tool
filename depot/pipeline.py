@@ -76,6 +76,7 @@ class PreparedDocument:
     file_into_dokumente: bool
     save_processed_copy: bool
     use_anthropic_classifier: bool
+    ask_cloud_when_unsure: bool = False
 
 
 class Pipeline:
@@ -542,6 +543,9 @@ class Pipeline:
             file_into_dokumente=file_into_dokumente,
             save_processed_copy=save_processed_copy,
             use_anthropic_classifier=use_anthropic_classifier,
+            ask_cloud_when_unsure=scan_config.load_cloud_when_unsure(
+                cfg.scan_eingang_local_path, cfg.config_subfolder, cfg.config_file_name
+            ),
         )
 
     # ---- stage 2: classification, filename, upload ---------------------------
@@ -616,6 +620,13 @@ class Pipeline:
                     **classify_args,
                     anthropic_api_key=cfg.anthropic_api_key,
                     anthropic_model=cfg.anthropic_model,
+                    embedder=self.embedder,
+                )
+            elif prepared.ask_cloud_when_unsure:
+                result, classifier_tags = classifier.classify_with_cloud_when_unsure(
+                    cfg.confidence_threshold, cfg.cloud_min_confidence,
+                    cfg.anthropic_api_key, cfg.anthropic_model,
+                    **classify_args, embedder=self.embedder,
                 )
             else:
                 result, classifier_tags = classifier.classify(**classify_args, embedder=self.embedder)

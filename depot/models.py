@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import date, timedelta
 from typing import Literal
 
@@ -21,6 +22,15 @@ _MAX_FUTURE_BUFFER = timedelta(days=MAX_FUTURE_DAYS)
 # dropped rather than trusted to the prompt alone.
 _MAX_KEYWORDS = 6
 _MAX_KEYWORD_LENGTH = 40
+_MAX_SUMMARY_LENGTH = 400
+_SUMMARY_EMAIL = re.compile(r"\S+@\S+")
+# Numbers that could identify someone or something: any run of digits
+# (optionally grouped by spaces, dots, slashes, dashes or prefixed by a few
+# capitals, as in an IBAN) with four or more digits in total - account,
+# customer, phone and policy numbers, amounts, full dates. A lone year
+# ("2026") stays.
+_SUMMARY_NUMBER = re.compile(r"(?<![\w-])[A-Z]{0,4}\d[\d ./-]*\d(?![\w-])")
+_SUMMARY_YEAR = re.compile(r"(19|20)\d{2}")
 
 
 def _normalize_confidence_value(v: float | int) -> float:
@@ -54,6 +64,22 @@ class ContentExtraction(BaseModel):
     # model (see extraction_json_schema) for the same reason as
     # `correspondent` above.
     keywords: list[str] = Field(default_factory=list)
+    # Two or three sentences on what the document is about, for the filing
+    # decision - the only description of the content the cloud classifier
+    # gets. No names, addresses or numbers (the prompt asks for that; what
+    # still looks like one is removed below).
+    summary: str = ""
+
+    @field_validator("summary", mode="before")
+    @classmethod
+    def _clean_summary(cls, v: object) -> str:
+        if not isinstance(v, str):
+            return ""
+        text = _SUMMARY_EMAIL.sub("", v)
+        text = _SUMMARY_NUMBER.sub(
+            lambda m: m[0] if _SUMMARY_YEAR.fullmatch(m[0]) or sum(c.isdigit() for c in m[0]) < 4 else "", text
+        )
+        return " ".join(text.split())[:_MAX_SUMMARY_LENGTH]
 
     @field_validator("confidence", mode="before")
     @classmethod
@@ -112,11 +138,13 @@ class ContentExtraction(BaseModel):
 
 def extraction_json_schema() -> dict:
     """ContentExtraction's JSON schema as given to the model, with
-    `keywords` marked required so the model actually fills it in."""
+    `keywords` and `summary` marked required so the model actually fills
+    them in."""
     schema = ContentExtraction.model_json_schema()
     required = schema.setdefault("required", [])
-    if "keywords" not in required:
-        required.append("keywords")
+    for name in ("keywords", "summary"):
+        if name not in required:
+            required.append(name)
     return schema
 
 

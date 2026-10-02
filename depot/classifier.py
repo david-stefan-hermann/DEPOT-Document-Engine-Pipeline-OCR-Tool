@@ -174,6 +174,13 @@ bedeutet issue_date "2026-07-31" (Jahr-Monat-Tag), NICHT "3107-07-20" oder \
 (z.B. ["Rechnung", "Strom", "Jahresabrechnung"]), die helfen, das Dokument \
 einer Ablage-Kategorie zuzuordnen. KEINE personenbezogenen Angaben: keine \
 Personennamen, Adressen, Nummern, Beträge oder Datumsangaben.
+- "summary" beschreibt in zwei bis drei kurzen Sätzen, WORUM es in dem \
+Dokument geht und zu welchem Lebensbereich/Gegenstand es gehört (z.B. \
+"Monatliche Gehaltsabrechnung eines Arbeitgebers." oder "Schreiben einer \
+Kfz-Versicherung zur Beitragsänderung für ein Motorrad."). Fahrzeugmodell, \
+Gerätetyp oder Produktname dürfen genannt werden. KEINE personenbezogenen \
+Angaben: keine Personennamen, Adressen, Kennzeichen, Nummern, Beträge oder \
+Datumsangaben.
 - "confidence" ist deine eigene Einschätzung (0.0-1.0), wie sicher du bei \
 Titel UND Datum bist. Sei ehrlich niedrig, wenn der Text schlecht lesbar \
 oder mehrdeutig ist.
@@ -186,10 +193,25 @@ Nextcloud-Ordnerstruktur ein.
 
 Du bekommst NUR: den extrahierten Absender, den Titel, ggf. den Dateinamen \
 bzw. PDF-Titel, den der Nutzer/Aussteller dem Dokument gegeben hat, ein \
-paar allgemeine Stichworte zum Thema, und die VOLLSTAENDIGE flache Liste \
-aller existierenden Ordnerpfade - bewusst KEINEN Dokumentinhalt \
-(Datenschutz: der eigentliche Dokumenttext bleibt lokal). Fehlt der \
-Absender, stuetze dich auf Dateiname, PDF-Titel und Stichworte.
+paar allgemeine Stichworte, eine kurze lokal erzeugte Zusammenfassung, und \
+die VOLLSTAENDIGE flache Liste aller existierenden Ordnerpfade - bewusst \
+KEINEN Dokumentinhalt (Datenschutz: der eigentliche Dokumenttext bleibt \
+lokal). Fehlt der Absender, stuetze dich auf Dateiname, PDF-Titel, \
+Stichworte und Zusammenfassung.
+
+Unter "Hinweise aus der bestehenden Ablage" steht, was lokal ueber den \
+Inhalt der Ordner bekannt ist: in welchen Ordnern bereits Dokumente \
+DESSELBEN ABSENDERS liegen und welche Ordner aehnliche Dokumente \
+enthalten. Das ist das staerkste Signal ueberhaupt - der Nutzer legt \
+Dokumente eines Absenders fast immer wieder am selben Ort ab, auch wenn \
+der Ordner anders heisst als der Absender (z.B. Abrechnungen einer \
+Depotbank im Ordner des Brokers). Liegen dort schon Dokumente desselben \
+Absenders, waehle diesen Ordner und lege KEINEN neuen an, ausser Titel und \
+Zusammenfassung sprechen eindeutig fuer ein voellig anderes Thema.
+
+Reine Jahres-Unterordner (2024, 2025, ...) fehlen in der Liste absichtlich; \
+das Jahr wird nach deiner Wahl automatisch aus dem Dokumentdatum bestimmt. \
+Schlage niemals einen Jahresordner als neuen Ordner vor.
 
 Antworte als JSON:
 - "action": "existing" wenn ein vorhandener Ordner aus der Liste wirklich \
@@ -636,6 +658,8 @@ def _build_anthropic_folder_user_content(
     filename_title: str | None = None,
     pdf_title: str | None = None,
     keywords: list[str] | tuple[str, ...] = (),
+    summary: str = "",
+    hints: list[str] | tuple[str, ...] = (),
 ) -> str:
     folder_list = "\n".join(sorted(existing_folders)) or "(keine Ordner vorhanden)"
     extra = ""
@@ -645,6 +669,12 @@ def _build_anthropic_folder_user_content(
         extra += f"PDF-Titel: {pdf_title}\n"
     if keywords:
         extra += f"Stichworte: {', '.join(keywords)}\n"
+    if summary:
+        extra += f"Zusammenfassung: {summary}\n"
+    extra += "\nHinweise aus der bestehenden Ablage:\n" + (
+        "\n".join(f"- {hint}" for hint in hints) if hints
+        else "- (nichts Passendes gefunden: weder Dokumente dieses Absenders noch aehnliche)"
+    ) + "\n"
     return f"""\
 Absender: {correspondent or "(kein Absender erkannt)"}
 Titel: {title}
@@ -665,15 +695,20 @@ def classify_folder_via_anthropic(
     filename_title: str | None = None,
     pdf_title: str | None = None,
     keywords: list[str] | tuple[str, ...] = (),
+    summary: str = "",
+    hints: list[str] | tuple[str, ...] = (),
 ) -> tuple[str, bool, float, list[str]]:
     """Single-shot cloud classification: unlike _walk_folder_tree, hands the
     WHOLE existing folder tree to the model in one call instead of walking
     it level by level - a frontier model doesn't need the small-model
     workaround that hierarchical descent exists for. Sends ONLY
     correspondent + title + the folder-path list, plus (when available) the
-    name the user gave the file, the PDF's metadata title and a few locally
-    generated general topic keywords - never the OCR text, so the actual
-    document content never leaves the local network.
+    name the user gave the file, the PDF's metadata title, a few locally
+    generated general topic keywords, a locally generated two-sentence
+    summary (no names/numbers) and `hints` - which folders already hold
+    documents of this sender or similar ones, as counts, never as file
+    names. Never the OCR text, so the actual document content never leaves
+    the local network.
 
     On ANY failure (no API key configured, network error, rate limit,
     invalid response), returns confidence=0.0 instead of raising, so the
@@ -688,7 +723,7 @@ def classify_folder_via_anthropic(
     try:
         client = anthropic.Anthropic(api_key=anthropic_api_key, timeout=timeout)
         user_content = _build_anthropic_folder_user_content(
-            correspondent, title, existing_folders, filename_title, pdf_title, keywords
+            correspondent, title, existing_folders, filename_title, pdf_title, keywords, summary, hints
         )
         # No temperature/seed knob here (unlike _OLLAMA_OPTIONS above):
         # current-generation Claude models removed sampling parameters from
@@ -737,6 +772,26 @@ def classify_folder_via_anthropic(
     return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"]
 
 
+def _cloud_hints(ranked: list[Candidate]) -> list[str]:
+    """The local shortlist as the cloud gets it: folder paths (which it has
+    anyway) with how many documents of this sender are filed there and how
+    strong the overall match is - no file names, no document content."""
+    hints = []
+    for candidate in ranked:
+        parts = []
+        if candidate.sender_files:
+            parts.append(
+                "1 Dokument desselben Absenders" if candidate.sender_files == 1
+                else f"{candidate.sender_files} Dokumente desselben Absenders"
+            )
+        if candidate.strength >= STRONG_EVIDENCE:
+            parts.append("starke Aehnlichkeit zu den dort abgelegten Dokumenten")
+        elif not parts:
+            parts.append("schwache Aehnlichkeit")
+        hints.append(f"{candidate.path}: {', '.join(parts)}")
+    return hints
+
+
 def _prepare_content(
     content: ContentExtraction,
     folder_files: dict[str, list[str]] | None,
@@ -767,22 +822,51 @@ def classify_via_anthropic(
     pdf_title: str | None = None,
     folder_files: dict[str, list[str]] | None = None,
     resolve_date: Callable[[date | None], date | None] | None = None,
+    embedder: Embedder | None = None,
 ) -> tuple[ClassificationOutcome, list[str]]:
     """Same contract as classify(), but the folder decision is delegated to
-    Anthropic (classify_folder_via_anthropic) instead of the local candidate
-    search. title/correspondent/issue_date extraction still runs fully
+    Anthropic (classify_folder_via_anthropic) instead of the local model.
+    title/correspondent/issue_date/summary extraction still runs fully
     locally via extract_content() - see classify_folder_via_anthropic for
-    exactly what reaches the cloud call. `folder_files` is only used locally
-    (canonical sender spelling); no filename of an already filed document
-    is ever sent."""
+    exactly what reaches the cloud call.
+
+    The local candidate search runs here too, as the source of the hints:
+    which folders already hold documents of this sender or similar ones.
+    `folder_files` itself stays local - no filename of an already filed
+    document is ever sent, only counts per folder. Year subfolders are not
+    offered to the cloud at all; the year follows from the document's date,
+    as in classify()."""
     if content is None:
         content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title)
     content = _prepare_content(content, folder_files, resolve_date)
+
+    query = DocumentQuery(
+        correspondent=content.correspondent, title=content.title, keywords=content.keywords,
+        filename_title=filename_title or "", pdf_title=pdf_title or "", text=ocr_text,
+    )
+    semantic = None
+    if embedder is not None:
+        semantic = semantic_similarities(embedder, query, existing_folders, folder_files, dokumente_root)
+    ranked = candidate_search.rank_candidates(query, existing_folders, folder_files, semantic=semantic)
+    offered = sorted(candidate_search.collapsed_folders(existing_folders, folder_files)) or existing_folders
+
     folder, is_new_folder, folder_confidence, tags = classify_folder_via_anthropic(
-        content.correspondent, content.title, existing_folders, dokumente_root,
+        content.correspondent, content.title, offered, dokumente_root,
         anthropic_api_key, anthropic_model,
         filename_title=filename_title, pdf_title=pdf_title, keywords=content.keywords,
+        summary=content.summary, hints=_cloud_hints(ranked),
     )
+    chosen = next((c for c in ranked if c.path == folder), None)
+    if not is_new_folder and folder != dokumente_root:
+        folder, is_new_folder, _, _ = _walk_folder_tree(
+            ocr_text, original_filename, existing_folders, dokumente_root, ollama_host, model, timeout,
+            start_path=folder, issue_date=content.issue_date, by_year_only=True,
+        )
+    if chosen is not None:
+        rank = next(n for n, c in enumerate(ranked, 1) if c.path == chosen.path)
+        tags.append(f"KANDIDAT-{rank} (Beleg {chosen.strength:.1f}, Absender-Dateien {chosen.sender_files})")
+    elif "ANTHROPIC-NICHT-ERREICHBAR" not in tags:
+        tags.append("OHNE-KANDIDAT")
     overall_confidence = min(content.confidence, folder_confidence)
     outcome = ClassificationOutcome(
         folder=folder,
@@ -793,6 +877,47 @@ def classify_via_anthropic(
         confidence=overall_confidence,
     )
     return outcome, tags
+
+
+def classify_with_cloud_when_unsure(
+    confidence_threshold: float,
+    cloud_min_confidence: float,
+    anthropic_api_key: str | None,
+    anthropic_model: str,
+    **classify_args,
+) -> tuple[ClassificationOutcome, list[str]]:
+    """Local first, cloud second: classify() decides; only when its result
+    would go to the review folder (confidence below `confidence_threshold`,
+    i.e. nothing in the tree backs the choice) the cloud classifier is asked
+    too, and its answer is filed if it is at least `cloud_min_confidence`
+    sure. Otherwise the document goes to review as before, carrying the
+    cloud's folder as the suggestion.
+
+    Measured on 120 documents (cloud asked for the 32 the local path left
+    unfiled; threshold 0.9): 10 more filed, 7 of them exactly right, 2 one
+    level off, 1 wrong. Accepting every cloud answer instead filed 31 and
+    got 12 of them wrong."""
+    content = classify_args.pop("content", None)
+    if content is None:
+        content = extract_content(
+            classify_args["ocr_text"], classify_args["original_filename"], classify_args["ollama_host"],
+            classify_args["model"], classify_args.get("timeout", 120.0), classify_args.get("pdf_title"),
+        )
+    outcome, tags = classify(**classify_args, content=content)
+    if outcome.confidence >= confidence_threshold or not anthropic_api_key:
+        return outcome, tags
+
+    cloud_args = {k: v for k, v in classify_args.items()}
+    cloud_outcome, cloud_tags = classify_via_anthropic(
+        **cloud_args, content=content, anthropic_api_key=anthropic_api_key, anthropic_model=anthropic_model,
+    )
+    if "ANTHROPIC-NICHT-ERREICHBAR" in cloud_tags:
+        return outcome, tags + ["ANTHROPIC-NICHT-ERREICHBAR"]
+    if cloud_outcome.confidence >= cloud_min_confidence:
+        return cloud_outcome, ["CLOUD-ENTSCHEIDUNG", *cloud_tags]
+    # Not sure enough either: review folder, with the cloud's folder as the suggestion.
+    unsure = cloud_outcome._replace(confidence=min(cloud_outcome.confidence, CONFIDENCE_UNBACKED))
+    return unsure, ["CLOUD-UNSICHER", *cloud_tags]
 
 
 def semantic_similarities(

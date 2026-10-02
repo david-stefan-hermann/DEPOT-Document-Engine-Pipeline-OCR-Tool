@@ -205,9 +205,16 @@ pipeline.py — zwei Stufen, damit CPU und GPU gleichzeitig arbeiten:
    │        es von Hand einsortiert, findet das nächste gleichartige Dokument es dort.
    │        Wer auch unbelegte Vorschläge automatisch abgelegt haben will, setzt
    │        `CONFIDENCE_THRESHOLD=0.5`.
-   │        Der Cloud-Pfad (`use_anthropic_classifier`) ersetzt die Schritte 2–5 durch
-   │        einen Anthropic-Aufruf mit der ganzen Ordnerliste und behält dessen eigene
-   │        Konfidenz; er ist von dieser Überarbeitung unberührt.
+   │        Der Cloud-Pfad (`use_anthropic_classifier`) ersetzt Schritt 3 durch einen
+   │        Anthropic-Aufruf mit der ganzen Ordnerliste (ohne Jahresordner) und behält
+   │        dessen eigene Konfidenz. Seit 2026-10-02 bekommt er die lokale Vorauswahl
+   │        aus Schritt 2 als Hinweise mit (Ordner + Anzahl Dokumente desselben
+   │        Absenders, keine Dateinamen) sowie eine lokal erzeugte Zusammenfassung;
+   │        das Jahr folgt wie lokal aus dem Datum.
+   │        Dritte Betriebsart `ask_cloud_when_unsure`: lokal entscheiden (Schritte
+   │        1–5) und nur, wenn das Ergebnis unbelegt wäre, die Cloud fragen; ihre
+   │        Antwort wird ab `CLOUD_MIN_CONFIDENCE` (0.9) abgelegt, sonst bleibt es
+   │        bei Unsortiert mit dem Cloud-Vorschlag. Messwerte: ueberarbeitungsplan 5f.
    │
    │        **Determinismus (2026-09-03):** beide Ollama-Aufrufe liefen mit
    │        `temperature=0.1` OHNE festen `seed` — ein Live-A/B-Test zeigte, dasselbe
@@ -458,7 +465,7 @@ DEPOT-Document-Engine-Pipeline-OCR-Tool/
    `MAX_CONCURRENT_JOBS=1` und manueller Kontrolle der Dateilog-Einträge für die ersten
    ein bis zwei Batches.
 
-Umgesetzt wurde bereits eine Offline-Testsuite (284 Tests) für alle Module, die ohne
+Umgesetzt wurde bereits eine Offline-Testsuite (291 Tests) für alle Module, die ohne
 echte Tesseract-/Ollama-/Nextcloud-Infrastruktur laufen (reine Logik, ein selbstgebauter
 Fake-WebDAV-Server über `httpx.MockTransport`, gemockte Ollama-Aufrufe). Die in Schritt 1–2
 beschriebenen Tests mit echten Beispiel-Scans stehen noch aus, sobald reale Dokumente zur

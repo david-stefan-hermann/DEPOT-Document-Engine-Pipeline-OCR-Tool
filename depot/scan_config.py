@@ -98,3 +98,18 @@ def load_processing_switches(
         file_into_dokumente = True
 
     return file_into_dokumente, save_processed_copy, use_anthropic_classifier
+
+
+def load_cloud_when_unsure(scan_eingang_local_path: str, config_subfolder: str, config_file_name: str) -> bool:
+    """Reads `ask_cloud_when_unsure` from DEPOT Config.json (default false):
+    decide the folder locally, and only for a document that would otherwise
+    go to the review folder ask the cloud classifier as well. Has no effect
+    while `use_anthropic_classifier` is true (then the cloud decides every
+    document anyway)."""
+    value = _load_json(scan_eingang_local_path, config_subfolder, config_file_name).get(
+        "ask_cloud_when_unsure", False
+    )
+    if not isinstance(value, bool):
+        log.warning("%s: 'ask_cloud_when_unsure' must be true/false; using default false.", config_file_name)
+        return False
+    return value

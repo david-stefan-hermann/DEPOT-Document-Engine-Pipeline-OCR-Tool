@@ -1,7 +1,7 @@
 import pytest
 from pydantic import ValidationError
 
-from depot.models import AnthropicFolderDecision, ContentExtraction, FolderStepDecision
+from depot.models import AnthropicFolderDecision, ContentExtraction, FolderStepDecision, extraction_json_schema
 
 
 # ---- ContentExtraction ----------------------------------------------------
@@ -233,3 +233,18 @@ def test_unparseable_issue_date_becomes_no_date_instead_of_crashing():
         {"title": "Police", "correspondent": "AXA", "issue_date": "2025-05-20", "confidence": 0.8}
     )
     assert ok.issue_date.isoformat() == "2025-05-20"
+
+
+def test_summary_loses_numbers_and_addresses_before_it_can_leave_the_machine():
+    content = ContentExtraction.model_validate({
+        "title": "Police", "correspondent": "AXA", "confidence": 0.8,
+        "summary": "Schreiben zur Kfz-Versicherung, Vertrag 12345678, IBAN DE12 3456 7890 1234, "
+                   "Kontakt max@example.org, Beitrag 2026.  Motorrad MT-07.",
+    })
+    assert "12345678" not in content.summary
+    assert "3456" not in content.summary
+    assert "@" not in content.summary
+    assert "2026" in content.summary and "MT-07" in content.summary
+    assert len(ContentExtraction.model_validate(
+        {"title": "x", "correspondent": "", "confidence": 0.5, "summary": "wort " * 500}).summary) <= 400
+    assert "summary" in extraction_json_schema()["required"]

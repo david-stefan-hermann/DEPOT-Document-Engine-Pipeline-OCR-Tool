@@ -422,7 +422,10 @@ def test_classify_via_anthropic_combines_content_and_cloud_folder_decision(monke
 
     def fake_folder_via_anthropic(*a, **k):
         calls.append(a)
+        sent.append(k)
         return ("Dokumente/Gesundheit", False, 0.95, [])
+
+    sent = []
 
     monkeypatch.setattr(classifier, "classify_folder_via_anthropic", fake_folder_via_anthropic)
 
@@ -439,11 +442,49 @@ def test_classify_via_anthropic_combines_content_and_cloud_folder_decision(monke
     assert outcome.title == "Mitgliedsbescheinigung"
     assert outcome.correspondent == "Techniker Krankenkasse"
     assert outcome.confidence == 0.8  # min(content=0.8, folder=0.95)
-    assert tags == []
+    assert tags == ["OHNE-KANDIDAT"]  # nothing in the tree backs the choice
     # only correspondent + title were passed to the cloud call - no ocr_text
     assert calls[0][:2] == ("Techniker Krankenkasse", "Mitgliedsbescheinigung")
-    assert calls[0][2] == EXISTING_FOLDERS
+    assert calls[0][2] == sorted(EXISTING_FOLDERS)
     assert calls[0][3] == "Dokumente"
+    # nothing of the document text in what goes out, in any field
+    assert "geheimer" not in repr(calls[0]) + repr(sent[0])
+
+
+def test_cloud_gets_sender_counts_as_hints_and_no_year_folders(monkeypatch):
+    """What the measurement showed the cloud was missing: where this sender's
+    documents already are (it proposed a new folder instead), and that year
+    folders follow from the date (it guessed the year)."""
+    statement = ContentExtraction(
+        title="Wertpapierabrechnung", correspondent="Musterbank", issue_date=date(2025, 6, 1),
+        confidence=0.9, summary="Abrechnung eines Wertpapierkaufs.",
+    )
+    sent = {}
+
+    def fake_folder_via_anthropic(correspondent, title, folders, root, key, model, **k):
+        sent.update(k, folders=folders)
+        return ("Dokumente/Finanzen/Depot", False, 0.95, [])
+
+    monkeypatch.setattr(classifier, "classify_folder_via_anthropic", fake_folder_via_anthropic)
+    monkeypatch.setattr(classifier, "_decide_folder_step", _no_model_call)
+
+    outcome, tags = classifier.classify_via_anthropic(
+        ocr_text="Wertpapierabrechnung Musterbank Kontonummer 123456", original_filename="scan.pdf",
+        existing_folders=TREE, ollama_host="http://fake", model="model",
+        anthropic_api_key="sk-ant-fake", anthropic_model="claude-haiku-4-5",
+        content=statement, folder_files=TREE_FILES,
+    )
+
+    assert not any(f.endswith(("/2024", "/2025")) for f in sent["folders"])
+    assert outcome.folder == "Dokumente/Finanzen/Depot/2025"  # year from the date, not from the cloud
+    assert sent["summary"] == "Abrechnung eines Wertpapierkaufs."
+    depot_hint = next(h for h in sent["hints"] if h.startswith("Dokumente/Finanzen/Depot:"))
+    assert "desselben Absenders" in depot_hint
+    # counts only - no name of a filed document, nothing from the text
+    filed_names = [n for names in TREE_FILES.values() for n in names]
+    assert not any(name in " ".join(sent["hints"]) for name in filed_names)
+    assert "123456" not in repr(sent)
+    assert any(t.startswith("KANDIDAT-") for t in tags)
 
 
 # ---- title signals in the prompts -------------------------------------------
@@ -1028,3 +1069,53 @@ def test_agreement_of_words_and_meaning_is_evidence_enough_to_file(monkeypatch):
     outcome_other, tags_other = classifier.classify(**kwargs, embedder=_FakeEmbedder("Ordner: Gesundheit"))
     assert outcome_other.confidence == classifier.CONFIDENCE_UNBACKED
     assert "WORT-UND-BEDEUTUNG-EINIG" not in tags_other
+
+
+# ---- local first, cloud only when the local path is unsure -------------------
+
+def _hybrid(monkeypatch, local_confidence, cloud_confidence=None, cloud_tags=()):
+    content = ContentExtraction(title="Zeugnis", correspondent="Gymnasium", confidence=0.95)
+    cloud_calls = []
+    monkeypatch.setattr(
+        classifier, "classify",
+        lambda **k: (classifier.ClassificationOutcome(folder="Dokumente/Lokal", is_new_folder=False, title="Zeugnis",
+                                           confidence=local_confidence), ["OHNE-KANDIDAT"]),
+    )
+
+    def fake_cloud(**k):
+        cloud_calls.append(k)
+        return (classifier.ClassificationOutcome(folder="Dokumente/Zeugnisse", is_new_folder=False, title="Zeugnis",
+                                      confidence=cloud_confidence or 0.0), list(cloud_tags))
+
+    monkeypatch.setattr(classifier, "classify_via_anthropic", fake_cloud)
+    outcome, tags = classifier.classify_with_cloud_when_unsure(
+        0.6, 0.9, "sk-ant-fake", "claude-haiku-4-5",
+        ocr_text="text", original_filename="scan.pdf", existing_folders=TREE, ollama_host="http://fake",
+        model="model", content=content,
+    )
+    return outcome, tags, cloud_calls
+
+
+def test_cloud_is_not_asked_when_the_local_decision_is_backed(monkeypatch):
+    outcome, tags, cloud_calls = _hybrid(monkeypatch, local_confidence=0.9)
+    assert outcome.folder == "Dokumente/Lokal" and cloud_calls == []
+
+
+def test_sure_cloud_answer_files_what_the_local_path_would_leave_unsorted(monkeypatch):
+    outcome, tags, cloud_calls = _hybrid(monkeypatch, local_confidence=0.5, cloud_confidence=0.95)
+    assert len(cloud_calls) == 1 and cloud_calls[0]["content"].title == "Zeugnis"  # no second extraction
+    assert outcome.folder == "Dokumente/Zeugnisse" and outcome.confidence == 0.95
+    assert tags[0] == "CLOUD-ENTSCHEIDUNG"
+
+
+def test_unsure_cloud_answer_stays_a_suggestion(monkeypatch):
+    outcome, tags, _ = _hybrid(monkeypatch, local_confidence=0.5, cloud_confidence=0.85)
+    assert outcome.folder == "Dokumente/Zeugnisse"  # shown as the suggestion
+    assert outcome.confidence == classifier.CONFIDENCE_UNBACKED  # below the filing threshold
+    assert tags[0] == "CLOUD-UNSICHER"
+
+
+def test_unreachable_cloud_keeps_the_local_result(monkeypatch):
+    outcome, tags, _ = _hybrid(monkeypatch, local_confidence=0.5, cloud_tags=["ANTHROPIC-NICHT-ERREICHBAR"])
+    assert outcome.folder == "Dokumente/Lokal" and outcome.confidence == 0.5
+    assert "ANTHROPIC-NICHT-ERREICHBAR" in tags

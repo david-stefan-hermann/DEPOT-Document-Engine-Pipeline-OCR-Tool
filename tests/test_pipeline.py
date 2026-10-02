@@ -1261,3 +1261,27 @@ def test_failing_tag_api_does_not_stop_the_filing(monkeypatch, tmp_path, pipelin
     assert client.get(f"Scan-Eingang/{scan.name}") is None
     assert "NEXTCLOUD-TAGS-FEHLGESCHLAGEN" in _get_log_text(fake_server, client)
     assert pipeline.state.should_quarantine(scan.name) is False
+
+
+def test_ask_cloud_when_unsure_switch_routes_to_the_hybrid_classifier(monkeypatch, tmp_path, fake_server, client):
+    _write_processing_switches(tmp_path, ask_cloud_when_unsure=True)
+    p = _make_pipeline(tmp_path, client, anthropic_api_key="sk-ant-fake")
+    scan = _make_scan(tmp_path)
+    _seed_source_on_server(p, client, scan)
+    monkeypatch.setattr(ocr, "process_file", _text_ocr())
+    monkeypatch.setattr(classifier, "classify", lambda **k: (_ for _ in ()).throw(AssertionError("not directly")))
+    calls = []
+
+    def fake_hybrid(threshold, cloud_min, key, anthropic_model, **kwargs):
+        calls.append((threshold, cloud_min, key))
+        return (ClassificationOutcome(folder="Dokumente/Zeugnisse", is_new_folder=False, title="Zeugnis",
+                                      confidence=0.95), ["CLOUD-ENTSCHEIDUNG"])
+
+    monkeypatch.setattr(classifier, "classify_with_cloud_when_unsure", fake_hybrid)
+
+    p.process_one(scan)
+
+    assert calls == [(0.6, 0.9, "sk-ant-fake")]
+    assert len([f for f in fake_server.files if f.startswith("Dokumente/Zeugnisse/")]) == 1
+    assert "CLOUD-ENTSCHEIDUNG" in _get_log_text(fake_server, client)
+    p.state.close()

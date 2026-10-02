@@ -497,6 +497,54 @@ als in 5d): altes Prompt 68 exakt / 36 Unsortiert / 13 falsch / 1 Abbruch, neues
 einzeln geprüft. Die Tag-Zuweisung ist nur gegen den Test-Server geprüft, nicht gegen die
 echte Nextcloud (lokal liegen keine Zugangsdaten).
 
+### 5f. Cloud-Pfad gemessen und verbessert (2026-10-02)
+
+Richtigstellung zu E2: gemeint war nie "ohne Cloud", sondern "der Dokumenttext bleibt lokal".
+Zielbild des Nutzers: OCR, Titel und eine Zusammenfassung lokal, die Ordnerwahl darf die
+Cloud treffen. Der Cloud-Pfad war bis hierhin nie gemessen (`tools/eval.py --cloud`).
+
+Erste Messung (Stand wie im Betrieb, Haiku 4.5, 120 Dokumente): 45 exakt, 10 eine Ebene
+daneben, 1 `Unsortiert`, **64 falsch einsortiert** — fast alle mit Konfidenz 0,75–0,95.
+Die Fehler: 20× neuer Ordner vorgeschlagen, obwohl ein passender existiert (die Cloud
+wusste nicht, wo ein Absender schon liegt), 13× nur der Jahresordner geraten, 17× anderer
+Hauptordner, 14× falscher Unterordner.
+
+Daraus die Änderungen am Cloud-Pfad — alles Dinge, die lokal schon vorhanden waren:
+
+- **Jahresordner aus dem Datum**: die Cloud bekommt die Ordnerliste ohne Jahresordner, das
+  Jahr folgt danach deterministisch (wie lokal).
+- **Hinweise aus der Ablage**: die lokale Vorauswahl als Text — Ordnerpfad plus "n
+  Dokumente desselben Absenders" bzw. "starke/schwache Ähnlichkeit". Nur Zahlen, keine
+  Dateinamen.
+- **Lokale Zusammenfassung**: neues Extraktionsfeld `summary` (zwei, drei Sätze ohne
+  Namen/Nummern; Ziffernfolgen und E-Mail-Adressen werden zusätzlich entfernt).
+
+Zweite Messung, Cloud und lokal direkt nacheinander auf demselben Baum:
+
+| Variante | exakt | eine Ebene daneben | `Unsortiert` | falsch |
+|---|---|---|---|---|
+| Cloud vorher | 45 | 10 | 1 | 64 |
+| **Cloud jetzt** | **87** | 7 | 1 | **25** |
+| lokal (mit `qwen3-embedding:0.6b`) | 78 | 1 | 32 | 9 |
+| lokal, bei `Unsortiert` Cloud — jede Antwort annehmen | 92 | 6 | 1 | 21 |
+| **lokal, bei `Unsortiert` Cloud — nur ab Konfidenz 0,9** | **85** | 3 | 22 | **10** |
+| lokal, bei `Unsortiert` Cloud — nur ab Konfidenz 0,8 | 89 | 3 | 14 | 14 |
+
+(Die "vorher"-Zeile stammt von einem etwas anderen Stand des Baums. Auch der lokale Wert
+ist mit 5d nicht direkt vergleichbar: der Baum hat sich durch die Testscans verändert und
+damit die Stichprobe.)
+
+Einordnung: die Cloud allein sortiert am meisten richtig ein, aber auch jedes fünfte
+Dokument falsch, weil sie praktisch nie "weiß ich nicht" sagt. Der lokale Pfad macht
+wenige Fehler und lässt ein Viertel liegen. Die Kombination — lokal entscheiden, nur für
+unbelegte Fälle die Cloud fragen und ihr nur bei hoher Konfidenz folgen — nimmt von beidem
+das Bessere: gegenüber "nur lokal" 10 Dokumente mehr abgelegt, davon 1 falsch.
+
+Umgesetzt als Schalter `ask_cloud_when_unsure` in `DEPOT Config.json` (Standard aus; wirkt
+nur, wenn `use_anthropic_classifier` aus ist) mit `CLOUD_MIN_CONFIDENCE` (Standard 0,9).
+Logtags: `CLOUD-ENTSCHEIDUNG` (Cloud-Antwort wurde abgelegt), `CLOUD-UNSICHER` (bleibt in
+`Unsortiert`, Vorschlag der Cloud in der Logzeile).
+
 ### Phase 3 — Durchsatz und Robustheit
 
 - **3.1 Zwei Stufen**: OCR-Worker (CPU) → LLM-Worker (GPU, genau 1, damit der Prompt-Cache

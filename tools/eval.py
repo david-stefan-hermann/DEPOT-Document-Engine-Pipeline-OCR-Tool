@@ -242,6 +242,7 @@ def main() -> None:
                 outcome, tags = classifier.classify_via_anthropic(
                     **kwargs, folder_files=loo_files, filename_title=name_signals.title,
                     anthropic_api_key=anthropic_api_key, anthropic_model=args.anthropic_model,
+                    **({"embedder": embedder} if embedder is not None else {}),
                 )
                 if "ANTHROPIC-NICHT-ERREICHBAR" in tags:
                     raise RuntimeError("Anthropic call failed")
