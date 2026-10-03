@@ -24,12 +24,12 @@ _MAX_KEYWORDS = 6
 _MAX_KEYWORD_LENGTH = 40
 _MAX_SUMMARY_LENGTH = 400
 _SUMMARY_EMAIL = re.compile(r"\S+@\S+")
-# Numbers that could identify someone or something: any run of digits
-# (optionally grouped by spaces, dots, slashes, dashes or prefixed by a few
-# capitals, as in an IBAN) with four or more digits in total - account,
-# customer, phone and policy numbers, amounts, full dates. A lone year
-# ("2026") stays.
-_SUMMARY_NUMBER = re.compile(r"(?<![\w-])[A-Z]{0,4}\d[\d ./-]*\d(?![\w-])")
+# Numbers that could identify someone or something: any run from a first to
+# a last digit (letters, dots, slashes and dashes in between, spaces only
+# between two digits, as in an IBAN), with the letters attached to it, and
+# four or more digits in total - account, customer, phone and policy
+# numbers, amounts, full dates. A lone year ("2026") stays.
+_SUMMARY_NUMBER = re.compile(r"[^\W\d_]*\d(?:[\w./-]|(?<=\d) (?=\d))*\d[^\W\d_]*")
 _SUMMARY_YEAR = re.compile(r"(19|20)\d{2}")
 
 
@@ -136,13 +136,16 @@ class ContentExtraction(BaseModel):
         return v
 
 
-def extraction_json_schema() -> dict:
+def extraction_json_schema(summary: bool = False) -> dict:
     """ContentExtraction's JSON schema as given to the model, with
-    `keywords` and `summary` marked required so the model actually fills
-    them in."""
+    `keywords` marked required so the model actually fills it in. The
+    `summary` only the cloud classifier reads is required with `summary`
+    and left out otherwise, so a fully local run does not generate it."""
     schema = ContentExtraction.model_json_schema()
     required = schema.setdefault("required", [])
-    for name in ("keywords", "summary"):
+    if not summary:
+        schema["properties"].pop("summary")
+    for name in ("keywords", "summary") if summary else ("keywords",):
         if name not in required:
             required.append(name)
     return schema

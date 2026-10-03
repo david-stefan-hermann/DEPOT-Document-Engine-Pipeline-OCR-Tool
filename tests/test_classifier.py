@@ -333,6 +333,19 @@ def test_classify_folder_via_anthropic_existing_folder(monkeypatch):
     assert "Mitgliedsbescheinigung" in sent["messages"][0]["content"]
 
 
+def test_cloud_naming_a_year_folder_means_the_folder_above(monkeypatch):
+    """Year folders are not offered; the year follows from the date."""
+    for decision in (
+        _decision_anthropic("existing", folder="Dokumente/Gesundheit/2025"),
+        _decision_anthropic("new_folder", folder="Dokumente/Gesundheit", new_folder_name="2025"),
+    ):
+        monkeypatch.setattr(classifier.anthropic, "Anthropic", lambda **kwargs: _FakeAnthropicClient(decision))
+        folder, is_new, confidence, tags = classifier.classify_folder_via_anthropic(
+            "Dr. Beispiel", "Rechnung", EXISTING_FOLDERS, "Dokumente", "sk-ant-fake", "claude-haiku-4-5",
+        )
+        assert (folder, is_new, confidence, tags) == ("Dokumente/Gesundheit", False, 0.9, [])
+
+
 def test_classify_folder_via_anthropic_new_folder_under_valid_parent(monkeypatch):
     fake_client = _FakeAnthropicClient(
         parsed_output=_decision_anthropic("new_folder", folder="Dokumente/Gesundheit", new_folder_name="Zahnarzt")
@@ -1073,8 +1086,8 @@ def test_agreement_of_words_and_meaning_is_evidence_enough_to_file(monkeypatch):
 
 # ---- local first, cloud only when the local path is unsure -------------------
 
-def _hybrid(monkeypatch, local_confidence, cloud_confidence=None, cloud_tags=()):
-    content = ContentExtraction(title="Zeugnis", correspondent="Gymnasium", confidence=0.95)
+def _hybrid(monkeypatch, local_confidence, cloud_confidence=None, cloud_tags=(), content_confidence=0.95):
+    content = ContentExtraction(title="Zeugnis", correspondent="Gymnasium", confidence=content_confidence)
     cloud_calls = []
     monkeypatch.setattr(
         classifier, "classify",
@@ -1113,6 +1126,25 @@ def test_unsure_cloud_answer_stays_a_suggestion(monkeypatch):
     assert outcome.folder == "Dokumente/Zeugnisse"  # shown as the suggestion
     assert outcome.confidence == classifier.CONFIDENCE_UNBACKED  # below the filing threshold
     assert tags[0] == "CLOUD-UNSICHER"
+
+
+def test_unsure_cloud_answer_is_never_surer_than_the_local_one(monkeypatch):
+    """Stays below the filing threshold wherever that is set."""
+    outcome, tags, _ = _hybrid(monkeypatch, local_confidence=0.2, cloud_confidence=0.85)
+    assert outcome.confidence == 0.2
+
+
+def test_cloud_without_a_usable_folder_keeps_the_local_suggestion(monkeypatch):
+    outcome, tags, _ = _hybrid(
+        monkeypatch, local_confidence=0.5, cloud_confidence=0.2, cloud_tags=["UNGUELTIGE-ORDNERWAHL"])
+    assert outcome.folder == "Dokumente/Lokal" and outcome.confidence == 0.5
+    assert "CLOUD-UNSICHER" in tags
+
+
+def test_cloud_is_not_asked_when_the_extraction_is_too_unsure_to_file_anyway(monkeypatch):
+    outcome, tags, cloud_calls = _hybrid(monkeypatch, local_confidence=0.5, cloud_confidence=0.95,
+                                         content_confidence=0.7)
+    assert outcome.folder == "Dokumente/Lokal" and cloud_calls == []
 
 
 def test_unreachable_cloud_keeps_the_local_result(monkeypatch):

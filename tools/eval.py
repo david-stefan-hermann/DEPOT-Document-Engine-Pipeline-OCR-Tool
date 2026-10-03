@@ -113,7 +113,9 @@ class ExtractionCache:
         if self._enabled and path.is_file():
             return ContentExtraction.model_validate_json(path.read_text(encoding="utf-8")), 0.0
         started = time.perf_counter()
-        content = self._classifier.extract_content(text, filename, host, model)
+        # With the summary, so the same cached extraction serves --cloud too
+        # (it is the last field: what comes before it is generated the same).
+        content = self._classifier.extract_content(text, filename, host, model, summary=True)
         seconds = time.perf_counter() - started
         path.write_text(content.model_dump_json(), encoding="utf-8")
         return content, seconds
@@ -242,7 +244,7 @@ def main() -> None:
                 outcome, tags = classifier.classify_via_anthropic(
                     **kwargs, folder_files=loo_files, filename_title=name_signals.title,
                     anthropic_api_key=anthropic_api_key, anthropic_model=args.anthropic_model,
-                    **({"embedder": embedder} if embedder is not None else {}),
+                    embedder=embedder,
                 )
                 if "ANTHROPIC-NICHT-ERREICHBAR" in tags:
                     raise RuntimeError("Anthropic call failed")

@@ -58,14 +58,18 @@ def filter_excluded(folders: list[str], excluded_prefixes: list[str]) -> list[st
 
 def load_processing_switches(
     scan_eingang_local_path: str, config_subfolder: str, config_file_name: str
-) -> tuple[bool, bool, bool]:
-    """Reads `file_into_dokumente`/`save_processed_copy`/`use_anthropic_classifier`
-    from DEPOT Config.json, e.g.:
+) -> tuple[bool, bool, bool, bool]:
+    """Reads `file_into_dokumente`/`save_processed_copy`/`use_anthropic_classifier`/
+    `ask_cloud_when_unsure` from DEPOT Config.json, e.g.:
         { "file_into_dokumente": true, "save_processed_copy": false, "use_anthropic_classifier": false }
     Read fresh on every call (a cheap local file read) rather than cached,
     so toggling a switch in the file takes effect on the very next document
     instead of waiting on the folder-listing cache TTL. Missing file/keys
-    default to (True, False, False) - the original fixed behavior. If
+    default to (True, False, False, False) - the original fixed behavior.
+    `ask_cloud_when_unsure`: decide the folder locally, and only for a
+    document that would otherwise go to the review folder ask the cloud
+    classifier as well; no effect while `use_anthropic_classifier` is true
+    (then the cloud decides every document anyway). If
     file_into_dokumente and save_processed_copy would both end up False,
     DEPOT would have nowhere to put a processed document before deleting
     the source scan - file_into_dokumente wins instead, with a warning,
@@ -89,6 +93,11 @@ def load_processing_switches(
         )
         use_anthropic_classifier = False
 
+    ask_cloud_when_unsure = data.get("ask_cloud_when_unsure", False)
+    if not isinstance(ask_cloud_when_unsure, bool):
+        log.warning("%s: 'ask_cloud_when_unsure' must be true/false; using default false.", config_file_name)
+        ask_cloud_when_unsure = False
+
     if not file_into_dokumente and not save_processed_copy:
         log.warning(
             "%s: both file_into_dokumente and save_processed_copy are false; "
@@ -97,19 +106,4 @@ def load_processing_switches(
         )
         file_into_dokumente = True
 
-    return file_into_dokumente, save_processed_copy, use_anthropic_classifier
-
-
-def load_cloud_when_unsure(scan_eingang_local_path: str, config_subfolder: str, config_file_name: str) -> bool:
-    """Reads `ask_cloud_when_unsure` from DEPOT Config.json (default false):
-    decide the folder locally, and only for a document that would otherwise
-    go to the review folder ask the cloud classifier as well. Has no effect
-    while `use_anthropic_classifier` is true (then the cloud decides every
-    document anyway)."""
-    value = _load_json(scan_eingang_local_path, config_subfolder, config_file_name).get(
-        "ask_cloud_when_unsure", False
-    )
-    if not isinstance(value, bool):
-        log.warning("%s: 'ask_cloud_when_unsure' must be true/false; using default false.", config_file_name)
-        return False
-    return value
+    return file_into_dokumente, save_processed_copy, use_anthropic_classifier, ask_cloud_when_unsure

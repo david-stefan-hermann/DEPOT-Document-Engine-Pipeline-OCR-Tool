@@ -519,9 +519,12 @@ def extract_content(
     model: str,
     timeout: float = 120.0,
     pdf_title: str | None = None,
+    summary: bool = False,
 ) -> ContentExtraction:
+    """`summary`: also have the model write the short summary the cloud
+    classifier gets - skipped otherwise, nothing local reads it."""
     messages = _build_content_messages(ocr_text, original_filename, pdf_title)
-    raw_content = _chat("extract", ollama_host, model, messages, extraction_json_schema(), timeout)
+    raw_content = _chat("extract", ollama_host, model, messages, extraction_json_schema(summary), timeout)
     try:
         payload = json.loads(raw_content)
         content = ContentExtraction.model_validate(payload)
@@ -717,7 +720,7 @@ def classify_folder_via_anthropic(
     already-locally-extracted title/correspondent/date are not lost, only
     the filing decision falls back to "needs manual review"."""
     if not anthropic_api_key:
-        log.warning("use_anthropic_classifier is enabled but no ANTHROPIC_API_KEY is configured.")
+        log.warning("The cloud classifier is switched on but no ANTHROPIC_API_KEY is configured.")
         return dokumente_root, False, 0.0, ["ANTHROPIC-NICHT-ERREICHBAR"]
 
     try:
@@ -744,22 +747,32 @@ def classify_folder_via_anthropic(
         log.warning("Anthropic folder classification failed (%s); routing to fallback.", exc)
         return dokumente_root, False, 0.0, ["ANTHROPIC-NICHT-ERREICHBAR"]
 
-    if decision.action == "existing":
-        if decision.folder in existing_folders:
-            return decision.folder, False, decision.confidence, []
-        match = closest_existing_leaf(decision.folder, existing_folders)
+    # A year folder named anyway (they are not offered, see
+    # classify_via_anthropic) means the folder above it: the year follows
+    # from the document's date, not from the model.
+    folder, action = decision.folder, decision.action
+    above, _, leaf = folder.rpartition("/")
+    if folder not in existing_folders and above and _YEAR_FOLDER.fullmatch(leaf):
+        folder = above
+    if action == "new_folder" and folder != dokumente_root and _YEAR_FOLDER.fullmatch(decision.new_folder_name or ""):
+        action = "existing"
+
+    if action == "existing":
+        if folder in existing_folders:
+            return folder, False, decision.confidence, []
+        match = closest_existing_leaf(folder, existing_folders)
         if match is not None and match[1] >= NEAR_DUPLICATE_THRESHOLD:
             return match[0], False, decision.confidence, [
-                f"AUTO-KORRIGIERT ({decision.folder} -> {match[0]})"
+                f"AUTO-KORRIGIERT ({folder} -> {match[0]})"
             ]
-        log.warning("Anthropic chose non-existent folder %r with no close match.", decision.folder)
+        log.warning("Anthropic chose non-existent folder %r with no close match.", folder)
         return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"]
 
     # action == "new_folder"
     if not decision.new_folder_name:
         return dokumente_root, False, INVALID_CHOICE_CONFIDENCE_CAP, ["UNGUELTIGE-ORDNERWAHL"]
 
-    parent = decision.folder
+    parent = folder
     if parent == dokumente_root or parent in existing_folders:
         return f"{parent}/{decision.new_folder_name}", True, decision.confidence, []
 
@@ -790,6 +803,33 @@ def _cloud_hints(ranked: list[Candidate]) -> list[str]:
             parts.append("schwache Aehnlichkeit")
         hints.append(f"{candidate.path}: {', '.join(parts)}")
     return hints
+
+
+def _shortlist(
+    content: ContentExtraction,
+    ocr_text: str,
+    existing_folders: list[str],
+    folder_files: dict[str, list[str]] | None,
+    dokumente_root: str,
+    filename_title: str | None,
+    pdf_title: str | None,
+    embedder: Embedder | None,
+) -> tuple[list[Candidate], dict[str, float] | None]:
+    """The folders that already hold similar documents, best first
+    (candidates.rank_candidates; with an `embedder`, blended with semantic
+    similarity), and those similarities (None without an embedder)."""
+    query = DocumentQuery(
+        correspondent=content.correspondent,
+        title=content.title,
+        keywords=content.keywords,
+        filename_title=filename_title or "",
+        pdf_title=pdf_title or "",
+        text=ocr_text,
+    )
+    semantic = None
+    if embedder is not None:
+        semantic = semantic_similarities(embedder, query, existing_folders, folder_files, dokumente_root)
+    return candidate_search.rank_candidates(query, existing_folders, folder_files, semantic=semantic), semantic
 
 
 def _prepare_content(
@@ -837,17 +877,12 @@ def classify_via_anthropic(
     offered to the cloud at all; the year follows from the document's date,
     as in classify()."""
     if content is None:
-        content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title)
+        content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title, summary=True)
     content = _prepare_content(content, folder_files, resolve_date)
 
-    query = DocumentQuery(
-        correspondent=content.correspondent, title=content.title, keywords=content.keywords,
-        filename_title=filename_title or "", pdf_title=pdf_title or "", text=ocr_text,
+    ranked, _ = _shortlist(
+        content, ocr_text, existing_folders, folder_files, dokumente_root, filename_title, pdf_title, embedder
     )
-    semantic = None
-    if embedder is not None:
-        semantic = semantic_similarities(embedder, query, existing_folders, folder_files, dokumente_root)
-    ranked = candidate_search.rank_candidates(query, existing_folders, folder_files, semantic=semantic)
     offered = sorted(candidate_search.collapsed_folders(existing_folders, folder_files)) or existing_folders
 
     folder, is_new_folder, folder_confidence, tags = classify_folder_via_anthropic(
@@ -891,7 +926,13 @@ def classify_with_cloud_when_unsure(
     i.e. nothing in the tree backs the choice) the cloud classifier is asked
     too, and its answer is filed if it is at least `cloud_min_confidence`
     sure. Otherwise the document goes to review as before, carrying the
-    cloud's folder as the suggestion.
+    cloud's folder as the suggestion (the local one if the cloud named no
+    usable folder).
+
+    The cloud's result can never be surer than the local extraction
+    (title/date) it builds on, so with an extraction below
+    `cloud_min_confidence` it is not asked at all - nothing leaves the
+    machine for an answer that could not be filed.
 
     Measured on 120 documents (cloud asked for the 32 the local path left
     unfiled; threshold 0.9): 10 more filed, 7 of them exactly right, 2 one
@@ -902,21 +943,27 @@ def classify_with_cloud_when_unsure(
         content = extract_content(
             classify_args["ocr_text"], classify_args["original_filename"], classify_args["ollama_host"],
             classify_args["model"], classify_args.get("timeout", 120.0), classify_args.get("pdf_title"),
+            summary=True,
         )
     outcome, tags = classify(**classify_args, content=content)
-    if outcome.confidence >= confidence_threshold or not anthropic_api_key:
+    if outcome.confidence >= confidence_threshold or content.confidence < cloud_min_confidence:
         return outcome, tags
 
-    cloud_args = {k: v for k, v in classify_args.items()}
+    # Without an API key this warns and comes back as not reachable.
     cloud_outcome, cloud_tags = classify_via_anthropic(
-        **cloud_args, content=content, anthropic_api_key=anthropic_api_key, anthropic_model=anthropic_model,
+        **classify_args, content=content, anthropic_api_key=anthropic_api_key, anthropic_model=anthropic_model,
     )
     if "ANTHROPIC-NICHT-ERREICHBAR" in cloud_tags:
         return outcome, tags + ["ANTHROPIC-NICHT-ERREICHBAR"]
+    if "UNGUELTIGE-ORDNERWAHL" in cloud_tags:
+        # No usable folder from the cloud: the local suggestion stays.
+        return outcome, tags + ["CLOUD-UNSICHER", "UNGUELTIGE-ORDNERWAHL"]
     if cloud_outcome.confidence >= cloud_min_confidence:
         return cloud_outcome, ["CLOUD-ENTSCHEIDUNG", *cloud_tags]
-    # Not sure enough either: review folder, with the cloud's folder as the suggestion.
-    unsure = cloud_outcome._replace(confidence=min(cloud_outcome.confidence, CONFIDENCE_UNBACKED))
+    # Not sure enough either: review folder, with the cloud's folder as the
+    # suggestion - and no surer than the local result, which is below the
+    # filing threshold whatever that is set to.
+    unsure = cloud_outcome._replace(confidence=min(cloud_outcome.confidence, outcome.confidence))
     return unsure, ["CLOUD-UNSICHER", *cloud_tags]
 
 
@@ -984,18 +1031,9 @@ def classify(
         content = extract_content(ocr_text, original_filename, ollama_host, model, timeout, pdf_title)
     content = _prepare_content(content, folder_files, resolve_date)
 
-    query = DocumentQuery(
-        correspondent=content.correspondent,
-        title=content.title,
-        keywords=content.keywords,
-        filename_title=filename_title or "",
-        pdf_title=pdf_title or "",
-        text=ocr_text,
+    ranked, semantic = _shortlist(
+        content, ocr_text, existing_folders, folder_files, dokumente_root, filename_title, pdf_title, embedder
     )
-    semantic = None
-    if embedder is not None:
-        semantic = semantic_similarities(embedder, query, existing_folders, folder_files, dokumente_root)
-    ranked = candidate_search.rank_candidates(query, existing_folders, folder_files, semantic=semantic)
     if ranked and ranked[0].strength >= STRONG_EVIDENCE:
         floor = _SHOWN_SCORE_SHARE * ranked[0].score
         ranked = [c for c in ranked if c.score >= floor][:_MAX_SHOWN_WITH_STRONG]

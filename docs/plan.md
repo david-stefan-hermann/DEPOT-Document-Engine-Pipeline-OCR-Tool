@@ -215,6 +215,11 @@ pipeline.py — zwei Stufen, damit CPU und GPU gleichzeitig arbeiten:
    │        1–5) und nur, wenn das Ergebnis unbelegt wäre, die Cloud fragen; ihre
    │        Antwort wird ab `CLOUD_MIN_CONFIDENCE` (0.9) abgelegt, sonst bleibt es
    │        bei Unsortiert mit dem Cloud-Vorschlag. Messwerte: ueberarbeitungsplan 5f.
+   │        Seit 2026-10-04 (Code-Review): keine Cloud-Anfrage, wenn schon die lokale
+   │        Extraktion unter `CLOUD_MIN_CONFIDENCE` liegt (die Antwort könnte nie
+   │        abgelegt werden); nennt die Cloud keinen gültigen Ordner, bleibt der
+   │        lokale Vorschlag; die Zusammenfassung wird nur noch in den Cloud-Modi
+   │        erzeugt.
    │
    │        **Determinismus (2026-09-03):** beide Ollama-Aufrufe liefen mit
    │        `temperature=0.1` OHNE festen `seed` — ein Live-A/B-Test zeigte, dasselbe

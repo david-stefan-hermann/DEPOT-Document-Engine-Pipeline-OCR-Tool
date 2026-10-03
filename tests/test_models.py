@@ -245,6 +245,13 @@ def test_summary_loses_numbers_and_addresses_before_it_can_leave_the_machine():
     assert "3456" not in content.summary
     assert "@" not in content.summary
     assert "2026" in content.summary and "MT-07" in content.summary
+    # identifiers with letters or a dash attached go as well
+    leaky = "Kunde KD-12345678, Police KV123456789X, Kundennr12345678, Az 12345678a, Code A1B2C3D4E5."
+    cleaned = ContentExtraction.model_validate(
+        {"title": "x", "correspondent": "", "confidence": 0.5, "summary": leaky}).summary
+    assert not any(c.isdigit() for c in cleaned)
     assert len(ContentExtraction.model_validate(
         {"title": "x", "correspondent": "", "confidence": 0.5, "summary": "wort " * 500}).summary) <= 400
-    assert "summary" in extraction_json_schema()["required"]
+    assert "summary" in extraction_json_schema(summary=True)["required"]
+    # a fully local run does not have the model write it at all
+    assert "summary" not in extraction_json_schema()["properties"]

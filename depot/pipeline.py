@@ -493,7 +493,7 @@ class Pipeline:
         # startup, so the user can toggle these directly in DEPOT
         # Config.json in Nextcloud and have it take effect on the very next
         # scan, the same way excluded_folders already works.
-        file_into_dokumente, save_processed_copy, use_anthropic_classifier = (
+        file_into_dokumente, save_processed_copy, use_anthropic_classifier, ask_cloud_when_unsure = (
             scan_config.load_processing_switches(
                 cfg.scan_eingang_local_path, cfg.config_subfolder, cfg.config_file_name
             )
@@ -543,9 +543,7 @@ class Pipeline:
             file_into_dokumente=file_into_dokumente,
             save_processed_copy=save_processed_copy,
             use_anthropic_classifier=use_anthropic_classifier,
-            ask_cloud_when_unsure=scan_config.load_cloud_when_unsure(
-                cfg.scan_eingang_local_path, cfg.config_subfolder, cfg.config_file_name
-            ),
+            ask_cloud_when_unsure=ask_cloud_when_unsure,
         )
 
     # ---- stage 2: classification, filename, upload ---------------------------
